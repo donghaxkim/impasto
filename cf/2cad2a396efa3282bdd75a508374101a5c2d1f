@@ -1,0 +1,33 @@
+package-lock.json
+  s_cb83b7aaab2fa0::t_d1d60baf9e0a74 1-1145
+preview.html
+  s_cb83b7aaab2fa0::t_204970616548ab 1-406
+src/geometry.ts
+  s_cb83b7aaab2fa0::t_cb431844d33294 1-315
+src/main.ts
+  s_cb83b7aaab2fa0::t_b64e03400e25d6 1-264
+src/renderer.ts
+  s_cb83b7aaab2fa0::t_1bf25ce00c8e3c 1-341
+src/scene.ts
+  s_cb83b7aaab2fa0::t_5b46e680a003b8 1-124
+src/shaders.ts
+  s_cb83b7aaab2fa0::t_83829496701fbe 1-313
+tests/milestone0.geometry.test.mjs
+  s_cb83b7aaab2fa0::t_b2921951de0435 1-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cf2cad2a396efa3282bdd75a508374101a5c2d1f",
+  "prompts": {},
+  "sessions": {
+    "s_cb83b7aaab2fa0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a183ac-c53f-70e2-b085-bbdf54b82059",
+        "model": "deepseek-v4-pro"
+      },
+      "human_author": "donghaxkim <donghaxkim@gmail.com>"
+    }
+  }
+}
