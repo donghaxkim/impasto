@@ -74,8 +74,9 @@ h2 { font: 500 17px 'Avenir Next', Avenir, sans-serif; letter-spacing: -.035em; 
 .control-section { padding: 18px 0 17px; border-bottom: 1px solid var(--line); }
 .section-label { display: flex; justify-content: space-between; align-items: center; color: #797970; font-size: 8px; letter-spacing: .12em; margin-bottom: 13px; }
 .section-index { color: #b0afa6; }
-.segmented { display: grid; grid-template-columns: 1fr 1fr; background: #f1f0ea; border-radius: 4px; padding: 3px; }
-.segmented button { border: 0; background: transparent; border-radius: 3px; padding: 8px 4px; color: #85857c; font-size: 10px; cursor: pointer; transition: all .16s; }
+.segmented { display: grid; grid-template-columns: repeat(2, 1fr); background: #f1f0ea; border-radius: 4px; padding: 3px; }
+.segmented.scene-toggle { grid-template-columns: repeat(3, 1fr); }
+.segmented button { border: 0; background: transparent; border-radius: 3px; padding: 8px 3px; color: #85857c; font-size: 10px; cursor: pointer; transition: all .16s; }
 .segmented button.selected { color: #383a34; background: #fffefa; box-shadow: 0 1px 3px rgba(48,47,42,.09); }
 .control-note { color: #a0a097; font-size: 10px; line-height: 1.45; margin: 9px 0 0; }
 .slider-control { display: block; margin-top: 16px; }

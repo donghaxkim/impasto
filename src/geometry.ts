@@ -44,28 +44,50 @@ function sampleCenterline(points: Vec2[]): Sample[] {
   }
   if (clean.length < 2) return [];
 
-  const samples: Sample[] = [];
+  const rawSamples: Sample[] = [];
   for (let segment = 0; segment < clean.length - 1; segment++) {
     const p1 = clean[segment];
     const p2 = clean[segment + 1];
     const p0 = clean[Math.max(0, segment - 1)];
     const p3 = clean[Math.min(clean.length - 1, segment + 2)];
     const length = distance(p1, p2);
-    // At most ~8 px between samples for crisp edges; dense enough for a
-    // smooth silhouette while keeping the mesh modest.
-    const count = Math.max(2, Math.min(48, Math.ceil(length / 8)));
+    // Sample the spline densely, then resample by arc length below. Sampling
+    // Catmull-Rom at even parameter steps clusters stations near duplicated
+    // endpoints, which makes a very wide ribbon twist on a sub-pixel step.
+    const count = Math.max(4, Math.min(1200, Math.ceil(length / 1.25)));
     for (let step = segment === 0 ? 0 : 1; step <= count; step++) {
       const [x, y] = catmullRom(p0, p1, p2, p3, step / count);
-      samples.push({ x, y, distance: 0 });
+      rawSamples.push({ x, y, distance: 0 });
     }
   }
 
-  let total = 0;
-  for (let i = 1; i < samples.length; i++) {
-    total += Math.hypot(samples[i].x - samples[i - 1].x, samples[i].y - samples[i - 1].y);
-    samples[i].distance = total;
+  let rawTotal = 0;
+  for (let i = 1; i < rawSamples.length; i++) {
+    rawTotal += Math.hypot(rawSamples[i].x - rawSamples[i - 1].x, rawSamples[i].y - rawSamples[i - 1].y);
+    rawSamples[i].distance = rawTotal;
   }
-  return total > EPSILON ? samples : [];
+  if (rawTotal <= EPSILON) return [];
+
+  // The final grid is uniform in painted arc length. A 2.5 px maximum station
+  // interval keeps width and pressure derivatives smooth while preventing
+  // isolated near-duplicate rings at sharp authored corners.
+  const stationCount = Math.max(2, Math.ceil(rawTotal / 2.5));
+  const samples: Sample[] = [];
+  let cursor = 0;
+  for (let station = 0; station <= stationCount; station++) {
+    const target = rawTotal * station / stationCount;
+    while (cursor < rawSamples.length - 2 && rawSamples[cursor + 1].distance < target) cursor++;
+    const a = rawSamples[cursor];
+    const b = rawSamples[cursor + 1];
+    const span = Math.max(EPSILON, b.distance - a.distance);
+    const t = Math.max(0, Math.min(1, (target - a.distance) / span));
+    samples.push({
+      x: a.x + (b.x - a.x) * t,
+      y: a.y + (b.y - a.y) * t,
+      distance: target,
+    });
+  }
+  return samples;
 }
 
 function cross(ax: number, ay: number, bx: number, by: number): number {
@@ -162,9 +184,31 @@ function hash01(seed: number, salt: number): number {
   return (n >>> 0) / 0xffffffff;
 }
 
-function taper(t: number, startRamp: number, full: number, endRamp: number): number {
-  if (t < startRamp) return full + (1 - full) * (t / startRamp);
-  if (t > 1 - endRamp) return 1 - (1 - 0.035) * ((t - (1 - endRamp)) / endRamp);
+function smoothstep01(value: number): number {
+  const t = Math.max(0, Math.min(1, value));
+  return t * t * (3 - 2 * t);
+}
+
+/** Shape the generous geometric envelope at the two ends. This is not the
+ * visible paint edge: the fragment cap mask carves the final chisel or round
+ * silhouette inside this ribbon. Keeping the mesh wide at its terminal ring
+ * prevents a top-down filbert from collapsing into a vector arrowhead before
+ * that mask has a chance to form the loaded tip. */
+function endShape(t: number, brush: Stroke['brush'], side: number, seed: number): number {
+  const flat = brush === 'flat';
+  const startSpan = flat ? 0.008 + hash01(seed, 0x6101 + side * 97) * 0.008 : 0.014 + hash01(seed, 0x6203 + side * 97) * 0.010;
+  const endSpan = flat ? 0.010 + hash01(seed, 0x6305 + side * 97) * 0.010 : 0.016 + hash01(seed, 0x6407 + side * 97) * 0.012;
+  const startEnvelope = 0.90 + hash01(seed, 0x6509 + side * 97) * 0.08;
+  const endEnvelope = 0.88 + hash01(seed, 0x660b + side * 97) * 0.10;
+  if (t < startSpan) {
+    const q = smoothstep01(t / startSpan);
+    return startEnvelope + (1 - startEnvelope) * q;
+  }
+  if (t > 1 - endSpan) {
+    const q = Math.max(0, Math.min(1, (t - (1 - endSpan)) / endSpan));
+    const irregular = 0.96 + valueNoise1D(q * 2.6 + side * 9.1, seed + 0x670d) * 0.08;
+    return (1 - (1 - endEnvelope) * smoothstep01(q)) * irregular;
+  }
   return 1;
 }
 
@@ -177,7 +221,7 @@ function pressureEnvelope(t: number, seed: number, side: number): number {
     if (index === 0 || index === positions.length - 1) return 0.86 + hash01(seed, 0x6a09e6 + side * 97) * 0.16;
     const random = hash01(seed, 0x3c6ef3 + index * 131 + side * 977);
     // Occasional broad loaded shoulders, with a separate value for each edge.
-    return 0.7 + random * 0.58;
+    return 0.82 + random * 0.30;
   });
   let segment = 0;
   while (segment < positions.length - 2 && t > positions[segment + 1]) segment++;
@@ -211,7 +255,7 @@ function edgeModulation(t: number, seed: number, side: number): number {
   for (let k = 0; k < depositCount; k++) {
     const center = hash01(seed, salt + 101 + k * 53);
     const breadth = 0.05 + hash01(seed, salt + 149 + k * 71) * 0.11;
-    const strength = (hash01(seed, salt + 197 + k * 89) - 0.25) * 0.42;
+    const strength = (hash01(seed, salt + 197 + k * 89) - 0.35) * 0.30;
     const distanceToCenter = Math.abs(t - center);
     wobble += strength * Math.exp(-(distanceToCenter * distanceToCenter) / (breadth * breadth));
   }
@@ -223,21 +267,21 @@ function edgeModulation(t: number, seed: number, side: number): number {
  * Vertices are packed as x, y, u (arc-length fraction), v (-1 left, +1 right).
  * Invalid/degenerate paths return empty typed arrays instead of NaN geometry.
  */
-export function buildStrokeMesh(stroke: Stroke): { vertices: Float32Array<ArrayBuffer>; indices: Uint32Array<ArrayBuffer> } {
+export type StrokeMesh = {
+  vertices: Float32Array<ArrayBuffer>;
+  indices: Uint32Array<ArrayBuffer>;
+  arcLength: number;
+};
+
+export function buildStrokeMesh(stroke: Stroke): StrokeMesh {
   const centerline = sampleCenterline(stroke.points);
-  if (centerline.length < 2) return { vertices: new Float32Array(), indices: new Uint32Array() };
+  if (centerline.length < 2) return { vertices: new Float32Array(), indices: new Uint32Array(), arcLength: 0 };
   if (hasNearReversal(centerline) || hasNonAdjacentIntersection(centerline)) {
-    return { vertices: new Float32Array(), indices: new Uint32Array() };
+    return { vertices: new Float32Array(), indices: new Uint32Array(), arcLength: 0 };
   }
 
   const total = centerline[centerline.length - 1].distance;
   const width = Number.isFinite(stroke.width) ? Math.max(0.5, Math.abs(stroke.width)) : 0.5;
-  const startLoadLeft = stroke.brush === 'flat' ? 0.76 : 0.48 + hash01(stroke.seed, 0x51f15e) * 0.1;
-  const startLoadRight = stroke.brush === 'flat' ? 0.83 : 0.54 + hash01(stroke.seed, 0x4cf5ad) * 0.1;
-  const startRampLeft = stroke.brush === 'flat' ? 0.045 : 0.085;
-  const startRampRight = stroke.brush === 'flat' ? 0.06 : 0.11;
-  const endRampLeft = 0.10 + hash01(stroke.seed, 0x1d872b) * 0.07;
-  const endRampRight = 0.12 + hash01(stroke.seed, 0x7f4a7c) * 0.08;
 
   const vertices = new Float32Array(centerline.length * 8);
   const leftWidths = new Float32Array(centerline.length);
@@ -248,8 +292,8 @@ export function buildStrokeMesh(stroke: Stroke): { vertices: Float32Array<ArrayB
     const t = current.distance / total;
     const loadLeft = pressureEnvelope(t, stroke.seed, 1);
     const loadRight = pressureEnvelope(t, stroke.seed, 2);
-    const leftRamp = taper(t, startRampLeft, startLoadLeft, endRampLeft) * loadLeft;
-    const rightRamp = taper(t, startRampRight, startLoadRight, endRampRight) * loadRight;
+    const leftRamp = endShape(t, stroke.brush, 1, stroke.seed) * loadLeft;
+    const rightRamp = endShape(t, stroke.brush, 2, stroke.seed) * loadRight;
     const curvatureLimit = curvatureHalfWidthLimit(centerline, i);
     curvatureLimits[i] = curvatureLimit;
     leftWidths[i] = Math.min(width * 0.5 * leftRamp * edgeModulation(t, stroke.seed, 1), curvatureLimit);
@@ -278,12 +322,19 @@ export function buildStrokeMesh(stroke: Stroke): { vertices: Float32Array<ArrayB
 
   for (let i = 0; i < centerline.length; i++) {
     const current = centerline[i];
-    const before = centerline[Math.max(0, i - 1)];
-    const after = centerline[Math.min(centerline.length - 1, i + 1)];
+    // Use a tangent stencil several stations wide. Immediately adjacent
+    // samples are only about 2.5 px apart, so a Catmull-Rom overshoot at an
+    // endpoint can rotate a one-sample tangent by nearly 90 degrees. That
+    // turns a very wide ribbon inside out even though the centerline itself
+    // is valid. A wider centered stencil remains smooth while retaining the
+    // dense stations needed for the silhouette.
+    const tangentStep = Math.max(2, Math.min(4, Math.round(7 / Math.max(1, total / centerline.length))));
+    const before = centerline[Math.max(0, i - tangentStep)];
+    const after = centerline[Math.min(centerline.length - 1, i + tangentStep)];
     let dx = after.x - before.x;
     let dy = after.y - before.y;
     let tangentLength = Math.hypot(dx, dy);
-    if (tangentLength < EPSILON) return { vertices: new Float32Array(), indices: new Uint32Array() };
+    if (tangentLength < EPSILON) return { vertices: new Float32Array(), indices: new Uint32Array(), arcLength: 0 };
     dx /= tangentLength;
     dy /= tangentLength;
     const t = current.distance / total;
@@ -311,5 +362,5 @@ export function buildStrokeMesh(stroke: Stroke): { vertices: Float32Array<ArrayB
     indices[k + 4] = v + 3;
     indices[k + 5] = v + 2;
   }
-  return { vertices, indices };
+  return { vertices, indices, arcLength: total };
 }

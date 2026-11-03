@@ -12,6 +12,18 @@ export interface Stroke {
   /** Impasto height in millimetres. */
   height: number;
   roughness: number;
+  /** Pigment coverage for thin, scumbled, or partially mixed paint films. */
+  opacity?: number;
+  /** Optional second pigment deposited as narrow, along-stroke ribbons. */
+  secondaryColor?: RGB;
+  /** Strength of the secondary pigment ribbon, from 0 (off) to 1 (full color). */
+  secondaryMix?: number;
+  /** Cross-section of the deposited paint, independent of the tool shape. */
+  profile?: 'knife' | 'loaded-filbert' | 'dry-scumble';
+  /** Amount of squeezed paint accumulated at the stroke perimeter (0–1). */
+  edgeRidge?: number;
+  /** How paint terminates at the end of a retained stroke. */
+  taperEnd?: 'blunt' | 'lifted' | 'berm';
 }
 
 export interface PaintingDocument {

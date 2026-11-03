@@ -1,6 +1,12 @@
 import './style.css';
 import { createRenderer } from './renderer';
-import { createDemoDocument, createDiagnosticDocument } from './scene';
+import {
+  createCloseupDocument,
+  createDemoDocument,
+  createDiagnosticDocument,
+  createMaterialBenchmarkDocument,
+  createMaterialStudyDocument,
+} from './scene';
 import type { PaintingDocument, RenderSettings } from './types';
 
 const defaults: RenderSettings = {
@@ -27,7 +33,7 @@ app.innerHTML = `
     <main class="workspace">
       <section class="stage-column" aria-label="Canvas viewport">
         <div class="stage-heading">
-          <div><p class="kicker">STUDY 01 <span>—</span> STILL LIFE IN RELIEF</p><h1>Light across<br class="mobile-break"> the surface.</h1></div>
+          <div><p class="kicker">STUDY 01 <span>—</span> PALETTE-KNIFE MATERIAL</p><h1>Paint, layered<br class="mobile-break"> up close.</h1></div>
           <div class="stage-heading-note"><span class="tiny-orb"></span><span>Relightable impasto<br>surface prototype</span></div>
         </div>
 
@@ -38,7 +44,7 @@ app.innerHTML = `
             <div class="canvas-message" id="canvas-message" role="status"><span class="loader"></span><span>Warming the paint surface…</span></div>
             <div class="light-hint" id="light-hint"><span class="sun-icon">✳</span><span>DRAG TO MOVE LIGHT</span></div>
           </div>
-          <div class="viewport-bottomline"><span id="scene-caption">COMPOSITION · OIL ON LINEN</span><span class="zoom-readout">1:1 <span>·</span> FIT</span></div>
+          <div class="viewport-bottomline"><span id="scene-caption">REFERENCE CROP · PALETTE-KNIFE DETAIL</span><span class="zoom-readout">1:1 <span>·</span> FIT</span></div>
         </div>
         <div class="stage-footnote"><span>01</span><span class="footnote-line"></span><span>Surface color and relief are rendered in separate passes.</span></div>
       </section>
@@ -48,8 +54,8 @@ app.innerHTML = `
 
         <section class="control-section scene-section">
           <div class="section-label"><span>SCENE</span><span class="section-index">01</span></div>
-          <div class="segmented scene-toggle" role="group" aria-label="Scene"><button class="selected" data-scene="composition">Composition</button><button data-scene="diagnostics">Diagnostics</button></div>
-          <p class="control-note" id="scene-note">A small study in layered pigment and directional light.</p>
+          <div class="segmented scene-toggle" role="group" aria-label="Scene"><button data-scene="composition">Composition</button><button data-scene="diagnostics">Diagnostics</button><button data-scene="closeup">Close-up</button><button data-scene="materials">Paint studies</button><button class="selected" data-scene="benchmark">Reference crop</button></div>
+          <p class="control-note" id="scene-note">A detailed close-up of overlapping palette-knife paint.</p>
         </section>
 
         <section class="control-section">
@@ -92,7 +98,8 @@ const gpuIndicator = document.querySelector<HTMLSpanElement>('#gpu-indicator')!;
 let settings: RenderSettings = { ...defaults };
 let currentDocument: PaintingDocument;
 let renderer: Awaited<ReturnType<typeof createRenderer>> | undefined;
-let activeScene: 'composition' | 'diagnostics' = 'composition';
+type SceneId = 'composition' | 'diagnostics' | 'closeup' | 'materials' | 'benchmark';
+let activeScene: SceneId = 'benchmark';
 let initGeneration = 0;
 let initializationQueue: Promise<void> = Promise.resolve();
 
@@ -141,13 +148,28 @@ function update(partial: Partial<RenderSettings>) {
   });
 }
 
-function setScene(scene: 'composition' | 'diagnostics') {
+function setScene(scene: SceneId) {
   activeScene = scene;
-  currentDocument = scene === 'composition' ? createDemoDocument() : createDiagnosticDocument();
-  document.querySelector('#scene-caption')!.textContent = scene === 'composition' ? 'COMPOSITION · OIL ON LINEN' : 'DIAGNOSTICS · MATERIAL FIELD';
+  currentDocument = scene === 'composition'
+    ? createDemoDocument()
+    : scene === 'diagnostics' ? createDiagnosticDocument()
+      : scene === 'materials' ? createMaterialStudyDocument()
+        : scene === 'benchmark' ? createMaterialBenchmarkDocument() : createCloseupDocument();
+  document.querySelector('#scene-caption')!.textContent = scene === 'composition'
+    ? 'COMPOSITION · OIL ON LINEN'
+    : scene === 'diagnostics' ? 'DIAGNOSTICS · MATERIAL FIELD'
+      : scene === 'materials' ? 'PAINT STUDIES · KNIFE / SCUMBLE / MIX'
+        : scene === 'benchmark' ? 'REFERENCE CROP · LOADED PAINT'
+          : 'CLOSE-UP · IMPASTO CROSSING';
   document.querySelector('#scene-note')!.textContent = scene === 'composition'
     ? 'A small study in layered pigment and directional light.'
-    : 'Separate color and height patterns reveal the material inputs.';
+    : scene === 'diagnostics'
+      ? 'Separate color and height patterns reveal the material inputs.'
+      : scene === 'materials'
+        ? 'Compare loaded knife faces, dry scumbling, and partially mixed color films.'
+        : scene === 'benchmark'
+          ? 'Opaque knife deposits, narrow pigment ribbons, and sparse scraped ground.'
+          : 'Large overlapping marks reveal paint contact, bristles, and edge relief.';
   renderer?.dispose();
   renderer = undefined;
   if (navigator.gpu) {
@@ -211,7 +233,7 @@ function initialize() {
   return initializationQueue;
 }
 
-currentDocument = createDemoDocument();
+currentDocument = createMaterialBenchmarkDocument();
 if (!('gpu' in navigator)) {
   gpuIndicator.classList.add('failed');
   gpuLabel.textContent = 'WebGPU unavailable';

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { buildStrokeMesh } from '../src/geometry.ts';
-import { createDemoDocument, createDiagnosticDocument } from '../src/scene.ts';
-import { lightingShader, surfaceShader } from '../src/shaders.ts';
+import { createCloseupDocument, createDemoDocument, createDiagnosticDocument } from '../src/scene.ts';
+import { lightingShader, substrateShader, surfaceShader } from '../src/shaders.ts';
 
 function triangleArea(a, b, c) {
   return Math.abs((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])) * 0.5;
@@ -37,16 +37,19 @@ function assertValidMesh(mesh, label) {
 test('authored documents are byte-for-byte deterministic across generations', () => {
   assert.deepEqual(createDemoDocument(), createDemoDocument());
   assert.deepEqual(createDiagnosticDocument(), createDiagnosticDocument());
+  assert.deepEqual(createCloseupDocument(), createCloseupDocument());
 });
 
-test('WGSL shaders do not use reserved `smooth` identifier', () => {
-  assert.doesNotMatch(surfaceShader, /\b(?:let|var|fn|struct)\s+smooth\b/);
+test('WGSL shaders do not reuse reserved identifiers that caused compilation failures', () => {
+  for (const shader of [surfaceShader, substrateShader, lightingShader]) {
+    const code = shader.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    assert.doesNotMatch(code, /\b(?:smooth|macro|patch)\b/);
+  }
   assert.match(surfaceShader, /smoothstep\(/, 'the smoothstep builtin remains available');
-  assert.doesNotMatch(lightingShader, /\b(?:let|var|fn|struct)\s+smooth\b/);
 });
 
 test('all authored strokes produce finite, indexed, non-degenerate ribbon geometry', () => {
-  for (const document of [createDemoDocument(), createDiagnosticDocument()]) {
+  for (const document of [createDemoDocument(), createDiagnosticDocument(), createCloseupDocument()]) {
     assert.ok(document.strokes.length > 0);
     for (const stroke of document.strokes) {
       const mesh = buildStrokeMesh(stroke);
@@ -91,12 +94,13 @@ test('duplicate and invalid points cannot create non-finite or degenerate geomet
   assert.deepEqual(buildStrokeMesh({ ...stroke, points: [[3, 3], [3, 3], [Infinity, 1]] }), {
     vertices: new Float32Array(),
     indices: new Uint32Array(),
+    arcLength: 0,
   });
 });
 
 test('unsafe reversals and nonadjacent centerline crossings are rejected', () => {
   const base = createDiagnosticDocument().strokes[0];
-  const rejected = { vertices: new Float32Array(), indices: new Uint32Array() };
+  const rejected = { vertices: new Float32Array(), indices: new Uint32Array(), arcLength: 0 };
   const reversal = buildStrokeMesh({ ...base, points: [[0, 0], [50, 0], [1, 0]], width: 34 });
   const crossing = buildStrokeMesh({ ...base, points: [[0, 0], [80, 80], [0, 80], [80, 0]], width: 24 });
   assert.deepEqual(reversal, rejected, 'near 180° reversal is rejected');
