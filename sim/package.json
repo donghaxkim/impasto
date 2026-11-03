@@ -1,0 +1,10 @@
+{
+  "name": "impasto-sim",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "render": "node --experimental-strip-types --no-warnings tests/render.ts",
+    "viewer": "node --experimental-strip-types --no-warnings tests/export-viewer.ts",
+    "test": "node --experimental-strip-types --no-warnings --test tests/sim.test.ts"
+  }
+}
