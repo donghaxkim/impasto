@@ -47,22 +47,92 @@ export function dcbrt(v: number): number {
   return x;
 }
 
-/** Integer avalanche hash in [0,1). */
-export function hash(a: number, b: number, c = 0): number {
-  let n = (Math.imul(a | 0, 0x9e3779b1) ^ Math.imul(b | 0, 0x85ebca77) ^ Math.imul(c | 0, 0xc2b2ae3d)) | 0;
+/** Final avalanche of the integer hash: int32 in, [0,1) out. */
+function hashMix(n: number): number {
   n = Math.imul(n ^ (n >>> 16), 0x45d9f3b);
   n = Math.imul(n ^ (n >>> 13), 0x45d9f3b);
   n ^= n >>> 16;
   return (n >>> 0) / 4294967296;
 }
-export function noise1(x: number, seed: number, salt = 0): number {
-  const i = Math.floor(x), f = x - i;
-  return lerp(hash(i, seed, salt), hash(i + 1, seed, salt), smooth(f));
+/** The (b, c) part of hash's seed mix, so a and b can be folded into one key when b and c are fixed. */
+const hashKey = (b: number, c: number) => Math.imul(b | 0, 0x85ebca77) ^ Math.imul(c | 0, 0xc2b2ae3d);
+/** hash(a, b, c) with key = hashKey(b, c). */
+const hashWith = (a: number, key: number) => hashMix((Math.imul(a | 0, 0x9e3779b1) ^ key) | 0);
+
+/** Integer avalanche hash in [0,1). */
+export function hash(a: number, b: number, c = 0): number {
+  return hashMix((Math.imul(a | 0, 0x9e3779b1) ^ Math.imul(b | 0, 0x85ebca77) ^ Math.imul(c | 0, 0xc2b2ae3d)) | 0);
 }
+export function noise1(x: number, seed: number, salt = 0): number {
+  const i = Math.floor(x), f = x - i, key = hashKey(seed, salt);
+  return lerp(hashWith(i, key), hashWith(i + 1, key), smooth(f));
+}
+const NOISE2_KEY = Math.imul(41, 0xc2b2ae3d);
 export function noise2(x: number, y: number, seed: number): number {
   const ix = Math.floor(x), iy = Math.floor(y), u = smooth(x - ix), v = smooth(y - iy);
-  const h = (a: number, b: number) => hash(a + Math.imul(b, 7919), seed, 41);
-  return lerp(lerp(h(ix, iy), h(ix + 1, iy), u), lerp(h(ix, iy + 1), h(ix + 1, iy + 1), u), v);
+  const key = Math.imul(seed | 0, 0x85ebca77) ^ NOISE2_KEY;
+  const r0 = Math.imul(iy, 7919), r1 = Math.imul(iy + 1, 7919);
+  return lerp(lerp(hashWith(ix + r0, key), hashWith(ix + 1 + r0, key), u), lerp(hashWith(ix + r1, key), hashWith(ix + 1 + r1, key), u), v);
+}
+/**
+ * noise2 along one row of the lattice: y and seed fixed, x varying over [xMin, xMax]. The row's
+ * lattice hashes are computed once and kept while later `set` calls stay on the same row (same
+ * floor(y), seed and x range), so a stroke that samples the same noise at hundreds of x positions
+ * per step, and at nearly the same y step after step, pays for a few hashes per row change
+ * instead of four per sample. Results are bit-identical to noise2 (the same hashes go through the
+ * same lerps); x outside the range falls back to noise2.
+ */
+export class Noise2Row {
+  private y = 0; private seed = NaN; private iy = NaN; private v = 0;
+  private base = 0; private n = 0;
+  private h0 = new Float64Array(0); private h1 = new Float64Array(0);
+  /** Bumped whenever the row's hashes change; `fill` keys its per-x cache on it. */
+  private gen = 0;
+  private fillGen = -1; private fillScale = NaN; private fillCount = 0;
+  /** For `fill`: the row's x-lerps at i * scale (NaN where x is outside the row and noise2 is used). */
+  private fa = new Float64Array(0); private fc = new Float64Array(0);
+  set(y: number, seed: number, xMin: number, xMax: number): void {
+    const iy = Math.floor(y);
+    this.y = y; this.v = smooth(y - iy);
+    const base = Math.floor(xMin), n = Math.floor(xMax) - base + 2;
+    if (iy === this.iy && seed === this.seed && base === this.base && n === this.n) return;
+    this.iy = iy; this.seed = seed; this.base = base; this.gen++;
+    if (!(n > 0)) { this.n = 0; return; }
+    this.n = n;
+    if (n > this.h0.length) { this.h0 = new Float64Array(n); this.h1 = new Float64Array(n); }
+    const { h0, h1 } = this, key = Math.imul(seed | 0, 0x85ebca77) ^ NOISE2_KEY;
+    const r0 = Math.imul(iy, 7919), r1 = Math.imul(iy + 1, 7919);
+    for (let k = 0; k < n; k++) { const ix = base + k; h0[k] = hashWith(ix + r0, key); h1[k] = hashWith(ix + r1, key); }
+  }
+  at(x: number): number {
+    const ix = Math.floor(x), k = ix - this.base;
+    if (!(k >= 0 && k + 1 < this.n)) return noise2(x, this.y, this.seed);
+    const u = smooth(x - ix), h0 = this.h0, h1 = this.h1;
+    return lerp(lerp(h0[k], h0[k + 1], u), lerp(h1[k], h1[k + 1], u), this.v);
+  }
+  /**
+   * out[i] = at(i * scale) for i in [0, count). The x-lerps of each sample depend only on the row
+   * and x, so they are kept across calls while the row and scale stay the same (a stroke's steps
+   * move y a little at a time), and each call is one lerp in y per sample.
+   */
+  fill(out: Float64Array, count: number, scale: number): void {
+    if (this.fillGen !== this.gen || this.fillScale !== scale || this.fillCount !== count) {
+      this.fillGen = this.gen; this.fillScale = scale; this.fillCount = count;
+      if (count > this.fa.length) { this.fa = new Float64Array(count); this.fc = new Float64Array(count); }
+      const { fa, fc, h0, h1 } = this;
+      for (let i = 0; i < count; i++) {
+        const x = i * scale, ix = Math.floor(x), k = ix - this.base;
+        if (!(k >= 0 && k + 1 < this.n)) { fa[i] = NaN; continue; }
+        const u = smooth(x - ix);
+        fa[i] = lerp(h0[k], h0[k + 1], u); fc[i] = lerp(h1[k], h1[k + 1], u);
+      }
+    }
+    const { fa, fc, v } = this;
+    for (let i = 0; i < count; i++) {
+      const a = fa[i];
+      out[i] = a !== a ? noise2(i * scale, this.y, this.seed) : lerp(a, fc[i], v);
+    }
+  }
 }
 export function fbm1(x: number, seed: number, salt = 0): number {
   return (noise1(x, seed, salt) * 4 + noise1(x * 2.1, seed, salt + 1) * 2 + noise1(x * 4.3, seed, salt + 2)) / 7;
