@@ -75,7 +75,7 @@ test('api: presets resolve over the library defaults by reference', () => {
   const oil = resolvePreset('oil'), locked = resolvePreset('locked');
   assert.deepEqual(PRESET_NAMES, ['oil', 'locked']);
   assert.deepEqual(oil.settings, { ...DEFAULT_SETTINGS, look: 'oil' });
-  assert.deepEqual(oil.light, { ...DEFAULT_LIGHT, look: 'oil', glow: 0, occlusion: 0.95 });
+  assert.deepEqual(oil.light, { ...DEFAULT_LIGHT, look: 'oil', glow: 0, occlusion: 0.95, elevation: 15 });
   assert.deepEqual(locked.settings, { ...DEFAULT_SETTINGS, look: 'locked' });
   assert.deepEqual(locked.light, { ...DEFAULT_LIGHT, look: 'locked' });
   // Overrides go on top, and nothing leaks back into the defaults.

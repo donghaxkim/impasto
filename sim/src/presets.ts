@@ -25,8 +25,9 @@ export const PRESETS: Record<PresetName, Preset> = {
    * scaling, restraint, streaked loads, toned underpainting) and the semi-gloss renderer.
    */
   // Dried paint shows no display glow (nothing on a satin coat is brighter than white for long) and
-  // keeps full-strength cast shadows under its lips and slabs.
-  oil: { plan: () => ({ look: 'oil' }), light: { look: 'oil', glow: 0, occlusion: 0.95 } },
+  // keeps full-strength cast shadows under its lips and slabs. The lamp starts low (15 degrees) so
+  // it rakes across the relief, as dried knife work is usually shown.
+  oil: { plan: () => ({ look: 'oil' }), light: { look: 'oil', glow: 0, occlusion: 0.95, elevation: 15 } },
 
   /**
    * The round-3 reference look, exactly what `npm run paint -- --look locked` produces: the
