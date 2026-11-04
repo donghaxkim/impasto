@@ -31,10 +31,44 @@ export function rasterizePlan(p: Plan, ground: RGB, mmPerPx: number, outlines = 
       if (best > r * r) continue;
       const o = (y * W + x) * 3;
       if (outlines && Math.sqrt(best) > r - 1.2) { const c = tint[st.layer % tint.length]; px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; continue; }
-      const band = ((across / r + 1) * 0.5 * 3.7 + st.seed * 0.0001) % 1;
-      const c = band < st.secondaryFraction ? st.secondary : st.primary;
+      const band = ((across / r + 1) * 0.5 * 3.7 + st.seed * 0.0001) % 1, prof = st.profile;
+      const main = prof ? prof[Math.min(prof.length - 1, Math.max(0, Math.floor((across / r + 1) * 0.5 * prof.length)))] : st.primary;
+      const c = band < st.secondaryFraction ? st.secondary : main;
       px[o] = c[0] * 255; px[o + 1] = c[1] * 255; px[o + 2] = c[2] * 255;
     }
   }
   return { w: W, h: H, px };
+}
+
+/**
+ * Which stroke is on top at each output pixel (plan index, -1 for none), the travel direction
+ * of that stroke there, and whether the pixel lies in its interior (within 60% of its half-width):
+ * for measuring colour variation within strokes. Knife strokes only when `knivesOnly`.
+ */
+export function strokeMap(p: Plan, mmPerPx: number, win: { x0: number; y0: number; w: number; h: number }, knivesOnly = true): { top: Int32Array; tx: Float32Array; ty: Float32Array; interior: Uint8Array } {
+  const { x0: ox, y0: oy, w: W, h: H } = win, n = W * H;
+  const top = new Int32Array(n).fill(-1), tx = new Float32Array(n), ty = new Float32Array(n), interior = new Uint8Array(n);
+  for (const st of p.strokes) {
+    if (knivesOnly && st.primitive === 'underpaint') continue;
+    const pts = st.footprint.map(([x, y]) => [x / mmPerPx - ox, y / mmPerPx - oy]), r = st.widthMm / 2 / mmPerPx;
+    let bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+    for (const [x, y] of pts) { bx0 = Math.min(bx0, x); bx1 = Math.max(bx1, x); by0 = Math.min(by0, y); by1 = Math.max(by1, y); }
+    const X0 = Math.max(0, Math.floor(bx0 - r)), X1 = Math.min(W - 1, Math.ceil(bx1 + r)), Y0 = Math.max(0, Math.floor(by0 - r)), Y1 = Math.min(H - 1, Math.ceil(by1 + r));
+    for (let y = Y0; y <= Y1; y++) for (let x = X0; x <= X1; x++) {
+      const cx = x + 0.5, cy = y + 0.5;
+      let best = 1e18, dx = 1, dy = 0;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const [ax, ay] = pts[i], [bx, by] = pts[i + 1], vx = bx - ax, vy = by - ay, l2 = vx * vx + vy * vy;
+        let t = l2 > 0 ? ((cx - ax) * vx + (cy - ay) * vy) / l2 : 0;
+        if ((i === 0 && t < 0) || (i === pts.length - 2 && t > 1)) continue;
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const ex = cx - (ax + vx * t), ey = cy - (ay + vy * t), d2 = ex * ex + ey * ey;
+        if (d2 < best && l2 > 0) { best = d2; const l = Math.sqrt(l2); dx = vx / l; dy = vy / l; }
+      }
+      if (best > r * r) continue;
+      const i = y * W + x;
+      top[i] = st.index; tx[i] = dx; ty[i] = dy; interior[i] = best < r * r * 0.36 ? 1 : 0;
+    }
+  }
+  return { top, tx, ty, interior };
 }

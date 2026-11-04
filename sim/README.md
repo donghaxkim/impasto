@@ -8,11 +8,13 @@ npm run paint    # plans and paints tests/fixtures/lake.png (about 4 min at --wi
 npm run paint -- photo.png --width 360 --plan-only   # just the stroke plan, in seconds
 npm run paint -- --look oil   # the same, with the new semi-gloss look
 npm run diagnose -- --fast    # three crops (mountains, spruce, lake): plan, colour, height, normals, render, metrics
+npm run diagnose -- --fast --scene portrait --look oil   # other scenes in tests/scenes.json (flowers, building, portrait; images in scenes/, not committed)
+npm run diagnose -- --fast --forms 0 --streaks 0 --tone 0   # this milestone's planner and pigment changes off, for comparison
 python3 tests/diag-sheet.py out/diag && python3 tests/diag-compare.py out/diag out/diag-<name>
 npm run gpu-parity            # WebGPU shader against the CPU reference, both looks (headless Chromium)
 ```
 
-The diagnostic reports, per crop: colour error and silhouettes kept at the plan, painted-colour and shaded stages; **expressiveness** (mean turn per stroke, share of curved strokes, width variation along strokes, variety of primitives); **relief hierarchy** (relief in structured against flat areas, sculptural peaks); and **physical realism** (share of paint in berms and heaps, groove index of fine ripple against form relief, bead index of glints breaking into specks, steep walls, and the volume ledger).
+The diagnostic reports, per crop: colour error and silhouettes kept at the plan, painted-colour and shaded stages; **expressiveness** (mean turn per stroke, share of curved strokes, width variation along strokes, variety of primitives); **relief hierarchy** (relief in structured against flat areas, sculptural peaks); and **physical realism** (share of paint in berms and heaps, groove index of fine ripple against form relief, bead index of glints breaking into specks, steep walls, and the volume ledger)); and **pigment** (colour gradient inside knife strokes against the photo's there, streak anisotropy as gradient across the stroke over gradient along it, and the share of the crop no knife stroke covers).
 
 ```sh
 npm test         # physics, stroke primitives, planner and determinism checks
@@ -87,6 +89,17 @@ Research behind it: `docs/prior-art-research.md`.
 
 - **Layers, coarse to fine** (Hertzmann 1998): a thin bristle underpainting, then knives of 15, 9.5, 6 and 3.6 mm, a 3.6 mm contour layer and 2.4 mm accents. Each layer compares a reference blurred to its scale with what is already on the canvas and only paints where the difference is large.
 - **Feedback:** with `npm run paint`, each layer is painted by the simulation before the next is planned, so later layers correct what the paint really did (berms, heaps, pickup), not what the planner assumed.
+- **Forms** (`forms.ts`): the image is split into a hierarchy of shapes, independent of subject. First Felzenszwalb–Huttenlocher superpixels, then Ward agglomerative merging (the pair whose union adds the least colour variance merges first). Snapshots are taken at about canvas area / d² shapes for d = 80, 35 and 15 mm. Each shape records its colour, principal axis, elongation, a figure-against-ground score, and per cell the distance to its edge and the edge's direction. `npm run forms -- --scene lake` writes `out/forms-<scene>.png`.
+- **Shapes bind strokes at their own scale:** block-in uses the coarse shapes, masses and forms the middle ones, and detail and accents the fine ones.
+  - For each layer, neighbours closer in colour than the layer's tolerance are merged, and shapes smaller than 1.5 square blade widths are absorbed. Parts narrower than 0.6 blade widths (lake between branches, a branch against the lake) are freed: they bind no stroke.
+  - A stroke stays in its shape's core, and its blade may reach at most a fifth of its width into a neighbour's.
+  - Seeds go only where the blade fits. A shape too narrow for a blade is left to a finer one, and a stroke that meets its shape's edge may be a single short press.
+  - The finest layers also seed in freed narrow parts (mullions, stems), narrowing their marks to fit.
+  - So the broad knives block in masses without eating smaller shapes, and each scale refines the one before it.
+- **Form-aware direction:** inside a shape, the direction blends three things:
+  - image edges, weighted by their coherence;
+  - the shape's principal axis, weighted by its elongation;
+  - near its edge, the edge itself.
 - **Direction:** strokes are traced both ways along the direction field. A fine field (edges) and a field three times wider (forms) are merged by coherence, so a tree is painted along its silhouette, not along each branch. Flat areas fall back to horizontal.
 - **Where small strokes go:** a layer's error is discounted where the image has little structure at its scale (after Im2Oil), so the sky and lake stay in broad strokes.
 - **Painting representation** (`structure.ts`): detail, coherence, silhouettes (strong, coherent, large-scale edges such as ridgelines, trunks and shores), flatness and a target relief map. The planner reads these, never what the subject is.
@@ -97,8 +110,9 @@ Research behind it: `docs/prior-art-research.md`.
 - **Primitives:** each stroke picks one from the maps under it, plus `pat` (a short, heavy press-and-lift for high-relief texture): `sweep` (flat areas: thin, pressed, almost no heap), `plane` (square ends, relief following the area), `mark` (fine coherent structure: tapered), `scumble` (fine incoherent texture: broken and partly starved), `contour`, and `accent` (light structured areas: thick with a full heap). Relief therefore has a hierarchy: quiet water and sky, emphatic rock and lights.
 - **Knife limits:** a stroke that cannot reach its layer's minimum length without crossing a colour edge is dropped instead of smearing. Narrow knives judge colour mostly by their centreline, so they can still paint a trunk thinner than the blade.
 - **Seeding:** worst error first on a grid, skipping strokes mostly over ones already placed (Paint Transformer's occlusion rule) or that would not bring the canvas closer to the image. Coverage layers add fill passes until no cell is bare.
-- **Order:** layer by layer, large to small (underpaint, block-in, masses, forms, detail, contours, accents). Inside a layer, where two strokes overlap, the one that matches the image better there is painted later, so it ends up on top; otherwise darks go before lights.
+- **Order:** layer by layer, large to small (underpaint, block-in, masses, forms, detail, contours, accents). Inside a layer, where two strokes overlap, the one that matches the image better there is painted later, so it ends up on top. Otherwise ground shapes go before figure shapes, then darks before lights.
 - **Loading:** each layer keeps one knife per colour family (twelve hue sectors, each dark and light, plus dark and light neutrals), so residue never carries teal into grey rock or turquoise lake into pale sky. Loads are at least 6x the simulation's yield volume (`yieldVolume` in `tool.ts`); near 1x the knife starves within millimetres and leaves pitted, broken paint. Lighter paint is laid thicker.
+- **Paint on the knife** (`oil` look, `streaks`): a knife is loaded with the colours found across its path, sampled at five points across the blade along the stroke. They are re-centred on the stroke's colour and kept within 0.1 OKLab of it. They go on in streaks, like paint picked up from a partly mixed pile (`Tool.loadProfile`). How well they are mixed depends on the primitive: quick presses and accents stay streaky, broad sweeps blend. A stroke crossing a light-to-dark turn of form carries both, as in faceted knife portraits. The underpainting is toned toward a warm dark (`underTone`, 0.3), so where it shows between knife strokes it reads as underpainting rather than as a gap.
 - **Deterministic:** only `+ - * / sqrt floor`, `dmath`, stable sorts with total-order keys, and hashing instead of a stateful random generator. `npm test` checks the plan and the painted canvas are identical across runs.
 
 Scale matters: knife sizes are physical, so a wider canvas gives more detail. At 240 mm the trees and peaks are smaller than the smallest stroke a knife can make; 360 mm reads well; 480 mm is finer still but takes about twice as long.

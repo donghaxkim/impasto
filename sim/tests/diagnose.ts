@@ -16,7 +16,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { readPng, writePng } from './png.ts';
-import { rasterizePlan } from './plan-raster.ts';
+import { rasterizePlan, strokeMap } from './plan-raster.ts';
 import { DEFAULT_SETTINGS, Planner, planPainting, type Plan } from '../src/planner.ts';
 import { contactProfile } from '../src/tool.ts';
 import { canvasColour, paintStrokes, startPainting, type Painting } from '../src/execute.ts';
@@ -26,22 +26,25 @@ import { oklab } from '../src/image.ts';
 
 const args = process.argv.slice(2);
 const opt = (n: string, d: string) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
-const widthMm = +opt('width', '360');
+// A scene from tests/scenes.json: image, canvas width and the crops to examine.
+const sceneName = opt('scene', 'lake');
+const scenes = JSON.parse(readFileSync(new URL('./scenes.json', import.meta.url), 'utf8'));
+const scene = scenes[sceneName];
+if (!scene) throw new Error(`no scene ${sceneName}; have ${Object.keys(scenes).join(', ')}`);
+const widthMm = +opt('width', String(scene.widthMm));
 const fast = args.includes('--fast');
-const out = new URL(`../out/diag${args.includes('--name') ? '-' + opt('name', '') : ''}/`, import.meta.url).pathname;
+const out = new URL(`../out/diag${sceneName === 'lake' ? '' : '-' + sceneName}${args.includes('--name') ? '-' + opt('name', '') : ''}/`, import.meta.url).pathname;
 mkdirSync(out, { recursive: true });
-const img = readPng(new URL('./fixtures/lake.png', import.meta.url).pathname);
+const img = readPng(new URL(`../${scene.image}`, import.meta.url).pathname);
 const look = opt('look', 'locked') as 'locked' | 'oil';
-const settings = { ...DEFAULT_SETTINGS, widthMm, look };
+// --forms 0 turns the form hierarchy off, --streaks 0 the streaked loads, --tone 0 the toned underpainting.
+const formSizesMm = opt('forms', '') === '0' ? [] : DEFAULT_SETTINGS.formSizesMm;
+const settings = { ...DEFAULT_SETTINGS, widthMm, look, formSizesMm, streaks: opt('streaks', '1') !== '0', underTone: +opt('tone', String(DEFAULT_SETTINGS.underTone)), restraint: +opt('restraint', String(DEFAULT_SETTINGS.restraint)) };
 const LIGHT = { ...DEFAULT_LIGHT, look };
 const VIEWS: View[] = ['paint', 'normal', 'cavity'];
 
 // Crops as fractions of the image: chosen to stress ridgelines, a thin tree, and broad water.
-export const CROPS = [
-  { name: 'mountains', x0: 0.27, y0: 0.02, x1: 0.47, y1: 0.32 },
-  { name: 'spruce', x0: 0.355, y0: 0.12, x1: 0.435, y1: 0.62 },
-  { name: 'lake', x0: 0.06, y0: 0.42, x1: 0.32, y1: 0.72 },
-];
+export const CROPS: { name: string; x0: number; y0: number; x1: number; y1: number }[] = scene.crops;
 
 /** Per stroke (by plan index): paint laid, and how much went to berms and the heap, mm^3. */
 interface StrokeVolumes { [index: number]: { laid: number; berm: number; heap: number } }
@@ -101,7 +104,9 @@ function paintCrops(): Record<string, State> {
 function paintOrLoad(): State {
   const key = createHash('sha256').update(readFileSync(new URL('../src/planner.ts', import.meta.url))).update(readFileSync(new URL('../src/tool.ts', import.meta.url)))
     .update(readFileSync(new URL('../src/canvas.ts', import.meta.url))).update(readFileSync(new URL('../src/relight.ts', import.meta.url)))
-    .update(readFileSync(new URL('../src/structure.ts', import.meta.url))).update(String(widthMm) + look).digest('hex').slice(0, 12);
+    .update(readFileSync(new URL('../src/structure.ts', import.meta.url))).update(readFileSync(new URL('../src/forms.ts', import.meta.url)))
+    .update(readFileSync(new URL('../src/execute.ts', import.meta.url))).update(readFileSync(new URL('../src/image.ts', import.meta.url)))
+    .update(String(widthMm) + look + sceneName + JSON.stringify(settings)).digest('hex').slice(0, 12);
   const meta = `${out}state-${key}.json`;
   if (existsSync(meta) && !args.includes('--fresh')) {
     const m = JSON.parse(readFileSync(meta, 'utf8'));
@@ -303,7 +308,33 @@ for (const c of CROPS) {
   }
   let glint = 0, dark = 0;
   for (let i = 0; i < n; i++) { if (shade[i * 3] > 240 && shade[i * 3 + 1] > 235 && shade[i * 3 + 2] > 220) glint++; if (shade[i * 3] + shade[i * 3 + 1] + shade[i * 3 + 2] < 150) dark++; }
+  // Pigment within strokes: colour gradient (OKLab per mm, at 0.3 mm) inside knife-stroke interiors,
+  // across the stroke against along it (streaks run along, so they show as gradient across), and
+  // how much of the crop no knife stroke covers (underpainting left to show).
+  const sm = strokeMap(st.plan, dx, { x0, y0, w: cw, h: ch }), r3 = Math.max(1, Math.round(0.3 / dx));
+  const Lc3 = blur3(labOf(colour, n), cw, ch, r3), Lp3 = blur3(labOf(ph, n), cw, ch, r3);
+  let gIn = 0, gPh = 0, gAcross = 0, gAlong = 0, nIn = 0, bare = 0;
+  const gvec = (A: Float32Array, i: number, x: number, y: number, ax: number, ay: number) => {
+    const xm = x > 0 ? i - 1 : i, xp = x + 1 < cw ? i + 1 : i, ym = y > 0 ? i - cw : i, yp = y + 1 < ch ? i + cw : i;
+    let s2 = 0;
+    for (let k = 0; k < 3; k++) { const gx = (A[xp * 3 + k] - A[xm * 3 + k]) / ((xp - xm) * dx || 1), gy = (A[yp * 3 + k] - A[ym * 3 + k]) / (((yp - ym) / cw) * dx || 1); const v = gx * ax + gy * ay; s2 += v * v; }
+    return Math.sqrt(s2);
+  };
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const i = y * cw + x;
+    if (sm.top[i] < 0) { bare++; continue; }
+    if (!sm.interior[i]) continue;
+    const tx = sm.tx[i], ty = sm.ty[i];
+    const ac = gvec(Lc3, i, x, y, -ty, tx), al = gvec(Lc3, i, x, y, tx, ty);
+    gAcross += ac; gAlong += al; gIn += Math.sqrt(ac * ac + al * al);
+    const pa = gvec(Lp3, i, x, y, -ty, tx), pl = gvec(Lp3, i, x, y, tx, ty);
+    gPh += Math.sqrt(pa * pa + pl * pl); nIn++;
+  }
   report[c.name] = {
+    pigment: {
+      withinStroke: nIn ? +(gIn / nIn).toFixed(4) : null, photoThere: nIn ? +(gPh / nIn).toFixed(4) : null,
+      streakAnisotropy: gAlong > 0 ? +(gAcross / gAlong).toFixed(2) : null, underExposedPct: +(100 * bare / n).toFixed(2),
+    },
     sizeMm: [+(cw * dx).toFixed(1), +(ch * dx).toFixed(1)],
     error: { plan: +meanDE(Lp, Lplan, n).toFixed(4), paintedColour: +meanDE(Lp, Lcol, n).toFixed(4), shaded: +meanDE(Lp, Lshade, n).toFixed(4) },
     silhouettes: { plan: edgeScore(plan), paintedColour: edgeScore(colour), shaded: edgeScore(shade) },

@@ -4,7 +4,8 @@ from PIL import Image, ImageDraw
 d = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), '..', 'out', 'diag')
 names = ['1-photo', '2-plan', '3-strokes', '4-colour', '5-height', '6-normal', '7-cavity', '8-paint']
 labels = ['photo', 'stroke plan', 'plan outlines', 'painted colour', 'height', 'normals', 'cavity term', 'shaded render']
-for crop in ['mountains', 'spruce', 'lake']:
+crops = sorted({f.rsplit('-', 2)[0] for f in os.listdir(d) if f.endswith('-1-photo.png')})
+for crop in crops:
     ims = [Image.open(os.path.join(d, f'{crop}-{n}.png')).convert('RGB') for n in names]
     w, h = ims[0].size
     s = min(1.0, 520 / max(w, h)) if w > h else min(1.0, 700 / h)

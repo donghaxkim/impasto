@@ -166,6 +166,37 @@ export class Tool {
     this.initialLoad = volumePerNode;
   }
 
+  /**
+   * Load paint whose colour varies across the blade, the way a knife picks up a partly mixed pile:
+   * `profile` gives colours from one blade end (node 0) to the other, and streaks of `secondary`
+   * run through it as in `load`. `mix` 0 keeps the colours in crisp interleaved streaks; 1 blends
+   * them into a smooth gradient with soft-edged streaks.
+   */
+  loadProfile(volumePerNode: number, profile: readonly RGB[], secondary: RGB, secondaryFraction: number, mix: number, seed: number, capacityRatio = 0.9): void {
+    const K = profile.length, ks = profile.map((c) => ksFromSrgb(c)), b = ksFromSrgb(secondary);
+    const { N } = this, { kind, widthMm } = this.spec;
+    const bandFreq = kind === 'knife' ? 0.45 : 1.5, m = mix < 0 ? 0 : mix > 1 ? 1 : mix;
+    const thr = 0.5 + (secondaryFraction - 0.5) * 0.42, soft = 0.02 + 0.2 * m;
+    const pig = [0, 0, 0];
+    for (let i = 0; i < N; i++) {
+      const q = (i + 0.5) / N * widthMm;
+      // Where across the blade this node draws from: wandering a little, in streaks.
+      const u = ((i + 0.5) / N + (fbm1(q * 0.8, seed, 23) - 0.5) * 0.35 * (1 - m)) * K - 0.5;
+      const k0 = u <= 0 ? 0 : u >= K - 1 ? K - 2 : Math.floor(u), f = K < 2 ? 0 : u <= 0 ? 0 : u >= K - 1 ? 1 : u - k0;
+      // Crisp: the nearer sample; mixed: the blend of the two.
+      const near = f < 0.5 ? 0 : 1, wgt = K < 2 ? 0 : near + (f - near) * m;
+      const a0 = ks[K < 2 ? 0 : k0], a1 = ks[K < 2 ? 0 : k0 + 1];
+      const band = fbm1(q * bandFreq, seed, 21);
+      const t = band < thr - soft ? 1 : band > thr + soft ? 0 : (thr + soft - band) / (2 * soft);
+      for (let k = 0; k < 3; k++) pig[k] = (a0[k] + (a1[k] - a0[k]) * wgt) * (1 - t) + b[k] * t;
+      const vol = volumePerNode * (0.62 + 0.76 * noise1(q * (kind === 'knife' ? 0.55 : 1.4), seed, 22));
+      this.v[i] += vol; this.loaded += vol;
+      for (let k = 0; k < 3; k++) { this.p[i * 3 + k] += pig[k] * vol; this.loadedP[k] += pig[k] * vol; }
+    }
+    this.capacity = volumePerNode * capacityRatio;
+    this.initialLoad = volumePerNode;
+  }
+
   /** Wipe a fraction of the remaining paint off on a rag. */
   wipe(fraction: number): void {
     for (let i = 0; i < this.N; i++) {

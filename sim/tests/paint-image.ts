@@ -8,7 +8,7 @@
  * outlines, coloured by layer), <name>-plan.json, and with the simulation <name>-paint.png,
  * -color.png, -height.png and -light-opposite.png.
  */
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { readPng, writePng } from './png.ts';
 import { DEFAULT_SETTINGS, planPainting, type Plan } from '../src/planner.ts';
@@ -19,9 +19,11 @@ import { linearToSrgb } from '../src/pigment.ts';
 const args = process.argv.slice(2);
 const opt = (name: string, def: string) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : def; };
 const flag = (name: string) => args.includes(`--${name}`);
-const imagePath = args[0] && !args[0].startsWith('--') ? args[0] : new URL('./fixtures/lake.png', import.meta.url).pathname;
-const name = opt('name', 'lake');
-const widthMm = +opt('width', '240');
+const scenes = JSON.parse(readFileSync(new URL('./scenes.json', import.meta.url), 'utf8'));
+const scene = scenes[opt('scene', 'lake')];
+const imagePath = args[0] && !args[0].startsWith('--') ? args[0] : new URL(`../${scene.image}`, import.meta.url).pathname;
+const name = opt('name', opt('scene', 'lake'));
+const widthMm = +opt('width', String(scene.widthMm));
 const seed = +opt('seed', '1');
 const layerCount = +opt('layers', String(DEFAULT_SETTINGS.layers.length));
 const gapScale = +opt('gap-scale', '1');
@@ -33,7 +35,8 @@ const LIGHT = { ...DEFAULT_LIGHT, look };
 mkdirSync(out, { recursive: true });
 
 const img = readPng(imagePath);
-const settings = { ...DEFAULT_SETTINGS, widthMm, seed, minLoad, look, layers: DEFAULT_SETTINGS.layers.slice(0, layerCount).map((l, i) => (i === 0 ? l : { ...l, gapMm: l.gapMm * gapScale })) };
+const formSizesMm = opt('forms', '') === '0' ? [] : opt('forms', '') ? opt('forms', '').split(',').map(Number) : DEFAULT_SETTINGS.formSizesMm;
+const settings = { ...DEFAULT_SETTINGS, widthMm, seed, minLoad, look, formSizesMm, layers: DEFAULT_SETTINGS.layers.slice(0, layerCount).map((l, i) => (i === 0 ? l : { ...l, gapMm: l.gapMm * gapScale })) };
 const t0 = Date.now();
 let painting: Painting | null = null;
 let simMs = 0;

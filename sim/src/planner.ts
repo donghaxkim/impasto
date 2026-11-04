@@ -21,6 +21,7 @@ import { linearToSrgb, srgbToLinear, type RGB } from './pigment.ts';
 import { directionAt, directionField, gaussBlur, makeGrid, mergeFields, resampleLinear, sample, toOklab, oklab, type Grid, type RgbImage } from './image.ts';
 import { yieldVolume, type ToolSpec, type Vec2 } from './tool.ts';
 import { mapAt, paintingMaps, type PaintingMaps } from './structure.ts';
+import { clearance, formHierarchy, regionsAtScale, type FormHierarchy, type FormLevel, type Regions } from './forms.ts';
 
 export interface LayerSpec {
   name: string;
@@ -68,6 +69,13 @@ export interface LayerSpec {
   kind?: 'fill' | 'contour';
   /** Choose a stroke primitive per stroke from the painting maps (default true; off for underpainting). */
   primitives?: boolean;
+  /**
+   * Form level whose forms this layer's strokes stay inside (0 coarsest; see PlanSettings.formSizesMm).
+   * A stroke ends where its centreline would leave its form, or, past its minimum length, where a
+   * blade edge would, so a broad knife never paints across a smaller shape: that shape is left to
+   * the finer layers. Omitted or -1: no form constraint.
+   */
+  formLevel?: number;
 }
 
 /**
@@ -100,6 +108,11 @@ export interface PlanSettings {
   flatDirection: Vec2; flatBias: number;
   /** Say of the larger form (a field smoothed 3x wider) in stroke direction, against fine edges. */
   formWeight: number;
+  /**
+   * Typical size of a form at each level of the form hierarchy, coarse first, mm. The image is split
+   * into about canvas area / size^2 forms per level (forms.ts).
+   */
+  formSizesMm: number[];
   /** Colour of the bare canvas, sRGB 0-1. */
   ground: RGB;
   /** Multiplier on OKLab chroma of the paint. 1 keeps the photo's saturation. */
@@ -122,6 +135,22 @@ export interface PlanSettings {
    * accents keep some texture. Pair it with the renderer's look of the same name.
    */
   look: 'locked' | 'oil';
+  /**
+   * With the 'oil' look: load each knife with the colours found across its path, in streaks, rather
+   * than one colour (Tool.loadProfile).
+   */
+  streaks: boolean;
+  /**
+   * Restraint inside shapes, 0-1: how much the form-bound layers discount their error deep inside a
+   * shape (more than two blade widths from its edge), so a shape painted as a broad plane stays one
+   * and detail gathers at edges and small shapes. 0 is off.
+   */
+  restraint: number;
+  /**
+   * With the 'oil' look: how far the underpainting is toned toward a warm dark (0 none, 1 fully), so
+   * where it shows between knife strokes it reads as underpainting.
+   */
+  underTone: number;
 }
 
 export interface PlannedStroke {
@@ -137,6 +166,8 @@ export interface PlannedStroke {
   widthMm: number; lengthMm: number;
   /** sRGB 0-1. */
   primary: RGB; secondary: RGB; secondaryFraction: number;
+  /** Optional colours across the blade, node 0's end first, and how well they are mixed (0-1). */
+  profile?: RGB[]; mix?: number;
   volumePerNode: number; gapMm: number; pressMm: number;
   /** Share of the residue wiped off before loading. */
   wipe: number;
@@ -178,19 +209,19 @@ export interface LayerStats {
 
 /** Layers for a canvas about 240 mm wide. Scale with `scaleLayers` for other sizes. */
 export const DEFAULT_LAYERS: LayerSpec[] = [
-  { name: 'underpaint', tool: 'bristle', widthMm: 22, nodes: 110, minLenMm: 40, maxLenMm: 90, spacing: 0.9, threshold: 0, tolerance: 0.14, blur: 0.6, flowBlur: 1.0, gapMm: 0.16, maxTurnDeg: 30, coverSkip: 0.55, passes: 2, sideWeight: 1, detail: 0, primitives: false },
-  { name: 'block-in', tool: 'knife', widthMm: 15, nodes: 128, minLenMm: 16, maxLenMm: 48, spacing: 0.75, threshold: 0.02, tolerance: 0.075, blur: 0.45, flowBlur: 0.8, gapMm: 0.22, maxTurnDeg: 14, coverSkip: 0.6, passes: 2, sideWeight: 1, detail: 0 },
-  { name: 'masses', tool: 'knife', widthMm: 9.5, nodes: 112, minLenMm: 11, maxLenMm: 34, spacing: 0.7, threshold: 0.035, tolerance: 0.065, blur: 0.35, flowBlur: 0.7, gapMm: 0.3, maxTurnDeg: 16, coverSkip: 0.6, passes: 2, sideWeight: 0.8, detail: 0.08 },
-  { name: 'forms', tool: 'knife', widthMm: 6, nodes: 88, minLenMm: 8, maxLenMm: 26, spacing: 0.7, threshold: 0.042, tolerance: 0.058, blur: 0.3, flowBlur: 0.6, gapMm: 0.34, maxTurnDeg: 18, coverSkip: 0.62, passes: 2, sideWeight: 0.55, detail: 0.14 },
-  { name: 'detail', tool: 'knife', widthMm: 3.6, nodes: 64, minLenMm: 5.5, maxLenMm: 18, spacing: 0.75, threshold: 0.05, tolerance: 0.052, blur: 0.25, flowBlur: 0.55, gapMm: 0.35, maxTurnDeg: 24, coverSkip: 0.65, passes: 2, sideWeight: 0.3, detail: 0.2 },
-  { name: 'contours', tool: 'knife', widthMm: 3.6, nodes: 64, minLenMm: 6, maxLenMm: 22, spacing: 1.2, threshold: 0.03, tolerance: 0.06, blur: 0.2, flowBlur: 0.5, gapMm: 0.32, maxTurnDeg: 30, coverSkip: 0.5, passes: 1, sideWeight: 0.3, detail: 0, kind: 'contour' },
-  { name: 'accents', tool: 'knife', widthMm: 2.4, nodes: 48, minLenMm: 4, maxLenMm: 14, spacing: 0.8, threshold: 0.06, tolerance: 0.05, blur: 0.2, flowBlur: 0.5, gapMm: 0.35, maxTurnDeg: 30, coverSkip: 0.65, passes: 1, sideWeight: 0.2, detail: 0.26 },
+  { name: 'underpaint', tool: 'bristle', widthMm: 22, nodes: 110, minLenMm: 40, maxLenMm: 90, spacing: 0.9, threshold: 0, tolerance: 0.14, blur: 0.6, flowBlur: 1.0, gapMm: 0.16, maxTurnDeg: 30, coverSkip: 0.55, passes: 2, sideWeight: 1, detail: 0, primitives: false, formLevel: -1 },
+  { name: 'block-in', tool: 'knife', widthMm: 15, nodes: 128, minLenMm: 16, maxLenMm: 48, spacing: 0.75, threshold: 0.02, tolerance: 0.075, blur: 0.45, flowBlur: 0.8, gapMm: 0.22, maxTurnDeg: 14, coverSkip: 0.6, passes: 2, sideWeight: 1, detail: 0, formLevel: 0 },
+  { name: 'masses', tool: 'knife', widthMm: 9.5, nodes: 112, minLenMm: 11, maxLenMm: 34, spacing: 0.7, threshold: 0.035, tolerance: 0.065, blur: 0.35, flowBlur: 0.7, gapMm: 0.3, maxTurnDeg: 16, coverSkip: 0.6, passes: 2, sideWeight: 0.8, detail: 0.08, formLevel: 1 },
+  { name: 'forms', tool: 'knife', widthMm: 6, nodes: 88, minLenMm: 8, maxLenMm: 26, spacing: 0.7, threshold: 0.042, tolerance: 0.058, blur: 0.3, flowBlur: 0.6, gapMm: 0.34, maxTurnDeg: 18, coverSkip: 0.62, passes: 2, sideWeight: 0.55, detail: 0.14, formLevel: 1 },
+  { name: 'detail', tool: 'knife', widthMm: 3.6, nodes: 64, minLenMm: 5.5, maxLenMm: 18, spacing: 0.75, threshold: 0.05, tolerance: 0.052, blur: 0.25, flowBlur: 0.55, gapMm: 0.35, maxTurnDeg: 24, coverSkip: 0.65, passes: 2, sideWeight: 0.3, detail: 0.2, formLevel: 2 },
+  { name: 'contours', tool: 'knife', widthMm: 3.6, nodes: 64, minLenMm: 6, maxLenMm: 22, spacing: 1.2, threshold: 0.03, tolerance: 0.06, blur: 0.2, flowBlur: 0.5, gapMm: 0.32, maxTurnDeg: 30, coverSkip: 0.5, passes: 1, sideWeight: 0.3, detail: 0, kind: 'contour', formLevel: -1 },
+  { name: 'accents', tool: 'knife', widthMm: 2.4, nodes: 48, minLenMm: 4, maxLenMm: 14, spacing: 0.8, threshold: 0.06, tolerance: 0.05, blur: 0.2, flowBlur: 0.5, gapMm: 0.35, maxTurnDeg: 30, coverSkip: 0.65, passes: 1, sideWeight: 0.2, detail: 0.26, formLevel: 2 },
 ];
 
 export const DEFAULT_SETTINGS: PlanSettings = {
   widthMm: 240, layers: DEFAULT_LAYERS, seed: 1, analysisMm: 0.5,
-  flatDirection: [1, 0], flatBias: 0.12, formWeight: 1.5, ground: [0.58, 0.47, 0.37], chroma: 1.06,
-  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked',
+  flatDirection: [1, 0], flatBias: 0.12, formWeight: 1.5, formSizesMm: [80, 35, 15], ground: [0.58, 0.47, 0.37], chroma: 1.06,
+  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0, underTone: 0.3,
 };
 
 /** Scale every length in the layers, for canvases larger or smaller than ~240 mm. */
@@ -217,6 +248,14 @@ export function planPainting(img: RgbImage, settings: Partial<PlanSettings> = {}
 
 const STEP = 0.25; // Tracing step as a share of the tool width.
 const MIN_RADIUS = 2.5; // Tightest turn a knife makes, in blade widths.
+/** A form-bound stroke keeps its centre this many blade widths inside its form (the blade reaches 0.5). */
+const FORM_FIT = 0.3;
+/** Smallest shape a form-bound blade respects, in square blade widths. */
+const REGION_MIN = 1.5;
+/** How short, as a share of the layer's minimum length, a press that meets a shape's edge may be. */
+const SHORT_PRESS = 0.5;
+/** Parts of a shape narrower than this many blade widths (half-width) bind no stroke of that blade. */
+const OPEN = 0.3;
 /**
  * Colour families, each with its own knife: twelve 30-degree hue sectors (turquoise and sky blue
  * are only about 30 degrees apart), each split into dark and light, then dark and light neutrals.
@@ -236,7 +275,13 @@ export function colourFamily(lab: ArrayLike<number>): number {
 }
 const SIDE = 0.36;
 /** Edge-profile strength per primitive in the 'oil' look. */
-const EDGE_FLAWS: Record<Primitive, number> = { underpaint: 1, sweep: 0.15, plane: 0.35, mark: 0.5, contour: 0.4, scumble: 0.65, pat: 0.7, accent: 0.6 }; // Lateral samples sit this share of the width either side of the centreline.
+const EDGE_FLAWS: Record<Primitive, number> = { underpaint: 1, sweep: 0.15, plane: 0.35, mark: 0.5, contour: 0.4, scumble: 0.65, pat: 0.7, accent: 0.6 };
+/** How well the paint on the knife is mixed per primitive with streaks on: broad sweeps blend, quick presses stay streaky. */
+const MIX: Record<Primitive, number> = { underpaint: 1, sweep: 0.75, plane: 0.35, mark: 0.45, contour: 0.6, scumble: 0.3, pat: 0.5, accent: 0.25 };
+/** Colours sampled across the blade for a streaked load. */
+const PROFILE = 5;
+/** A warm dark (burnt-sienna-like, OKLab) that the underpainting is toned toward. */
+const UNDER_TONE = [0.42, 0.05, 0.07];
 
 export class Planner {
   readonly s: PlanSettings;
@@ -248,7 +293,11 @@ export class Planner {
   readonly plan: Plan;
   /** The painting representation: detail, coherence, silhouettes, flatness, target relief. */
   readonly maps: PaintingMaps;
+  /** The form hierarchy (forms.ts), coarse level first. */
+  readonly forms: FormHierarchy;
   private readonly cell: number;
+  /** Lightly blurred image for sampling colour across a stroke (streaked loads), this layer. */
+  private profRef: Grid | null = null;
 
   constructor(img: RgbImage, s: PlanSettings) {
     this.s = s;
@@ -259,6 +308,8 @@ export class Planner {
     this.lin = resampleLinear(img, this.gw, this.gh);
     this.lab = toOklab(this.lin);
     this.maps = paintingMaps(this.lab, s.analysisMm);
+    const areaMm2 = s.widthMm * heightMm;
+    this.forms = formHierarchy(this.lab, s.formSizesMm.map((d) => Math.max(3, Math.round(areaMm2 / (d * d)))));
     this.current = makeGrid(this.gw, this.gh, 3);
     const g = [srgbToLinear(s.ground[0]), srgbToLinear(s.ground[1]), srgbToLinear(s.ground[2])];
     for (let i = 0; i < this.gw * this.gh; i++) for (let k = 0; k < 3; k++) this.current.data[i * 3 + k] = g[k];
@@ -274,18 +325,35 @@ export class Planner {
     const L = this.s.layers[l], { gw, gh, cell } = this, n = gw * gh, seed = this.s.seed;
     const W = L.widthMm / cell; // tool width in cells
     const ref = toOklab(gaussBlur(this.lin, L.blur * W));
+    this.profRef = this.s.look === 'oil' && this.s.streaks ? toOklab(gaussBlur(this.lin, Math.max(0.6, 0.12 * W))) : null;
     const base = gaussBlur(this.lab, 0.6);
     const flow = mergeFields(
       directionField(base, L.flowBlur * W, this.s.flatDirection, this.s.flatBias),
       directionField(base, L.flowBlur * W * 3, this.s.flatDirection, this.s.flatBias), this.s.formWeight);
     // Marks and contours follow the fine edge field (organic contours); planes and sweeps the merged one.
-    const fineFlow = directionField(base, Math.max(1.5, L.flowBlur * W * 0.6), this.s.flatDirection, this.s.flatBias * 0.5);
+    const fineFlow0 = directionField(base, Math.max(1.5, L.flowBlur * W * 0.6), this.s.flatDirection, this.s.flatBias * 0.5);
+    // Inside a form, strokes also follow the form itself: its axis where it is elongated, its contour
+    // near its boundary, image edges where they are clear.
+    const level = L.formLevel !== undefined && L.formLevel >= 0 && L.threshold > 0 && this.forms.levels.length ? this.forms.levels[Math.min(L.formLevel, this.forms.levels.length - 1)] : null;
+    const flowF = level ? formFlow(flow, level, W, 1) : flow;
+    const fineFlow = level ? formFlow(fineFlow0, level, W, 0.5) : fineFlow0;
+    // The shapes this blade respects: distinct in colour and big enough for it.
+    const region = level ? regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W * W, OPEN * W) : null;
+    const fit = FORM_FIT * W + 0.75;
+    // Shapes narrower than the finest blades (a mullion, a stem) bind no blade; the finest layers
+    // still paint them, narrowing their marks to fit (widthRatios).
+    const thinSeeds = !!level && L.formLevel! >= this.forms.levels.length - 1;
     const cur = toOklab(this.current);
     const err = new Float64Array(n);
     for (let i = 0; i < n; i++) err[i] = dist(ref.data, i * 3, cur.data, i * 3);
     // Seeding error: discounted where the image has little structure at this scale.
     const seedErr = err.slice();
     if (L.detail > 0) for (let i = 0; i < n; i++) seedErr[i] *= smoothstep((flow.data[i * 4 + 3] - L.detail * 0.5) / L.detail);
+    // Restraint: deep inside a shape, leave the broad plane alone.
+    if (region && this.s.restraint > 0 && L.detail > 0) for (let i = 0; i < n; i++) {
+      const lb = region.label[i];
+      if (lb >= 0) seedErr[i] *= 1 - this.s.restraint * smoothstep((clearance(region, i, lb) - W) / W);
+    }
 
     const covered = new Uint8Array(n);
     const st: LayerStats = { seeds: 0, tooShort: 0, overlapping: 0, noGain: 0, accepted: 0, primitives: {} };
@@ -304,7 +372,8 @@ export class Planner {
         for (let y = by < 0 ? 0 : by; y < by + step && y < gh; y++) for (let x = bx < 0 ? 0 : bx; x < bx + step && x < gw; x++) {
           const i = y * gw + x;
           sum += seedErr[i]; cnt++;
-          if (!covered[i]) { open++; if (seedErr[i] > bestE) { bestE = seedErr[i]; best = i; } }
+          // Seeds go where the blade fits inside its shape.
+          if (!covered[i]) { open++; if (seedErr[i] > bestE && (!region || (region.label[i] >= 0 ? clearance(region, i, region.label[i]) >= fit : thinSeeds))) { bestE = seedErr[i]; best = i; } }
         }
         if (!cnt || best < 0 || (!fill && open < cnt * 0.25)) continue;
         const mean = sum / cnt;
@@ -318,7 +387,7 @@ export class Planner {
         if (covered[c.y * gw + c.x]) continue;
         st.seeds++;
         const style = this.seedStyle(c.x + 0.5, c.y + 0.5, L);
-        const t = this.trace(c.x + 0.5, c.y + 0.5, W, L, ref, style.fine ? fineFlow : flow, style.turnDeg === L.maxTurnDeg ? cosTurn : cosDeg(style.turnDeg), style.lenMul);
+        const t = this.trace(c.x + 0.5, c.y + 0.5, W, L, ref, style.fine ? fineFlow : flowF, style.turnDeg === L.maxTurnDeg ? cosTurn : cosDeg(style.turnDeg), style.lenMul, region);
         if (!t) { st.tooShort++; continue; }
         // A bristle brush has round ends; a knife has square ones.
         const fp = this.footprint(t.pts, W, L.tool === 'bristle');
@@ -363,8 +432,11 @@ export class Planner {
    */
   private orderLayer(strokes: Traced[], ref: Grid, l: number): Traced[] {
     const n = strokes.length, seed = this.s.seed, cells = this.gw * this.gh;
-    const key = strokes.map((t, k) => ({ band: Math.min(3, Math.floor(t.lab[0] * 4)), tie: hash(seed, l * 7 + 3, k), k }));
-    const before = (a: number, b: number) => key[a].band - key[b].band || key[a].tie - key[b].tie || a - b;
+    // Ground forms before figure forms (forms.ts), then darks before lights.
+    const fl = this.forms.levels[Math.min(1, this.forms.levels.length - 1)];
+    const figOf = (t: Traced) => { if (!fl) return 0; let f = 0; for (const c of t.cells) f += fl.figure[fl.label[c]]; return t.cells.length ? f / t.cells.length : 0; };
+    const key = strokes.map((t, k) => ({ fig: Math.min(2, Math.floor(figOf(t) * 3)), band: Math.min(3, Math.floor(t.lab[0] * 4)), tie: hash(seed, l * 7 + 3, k), k }));
+    const before = (a: number, b: number) => key[a].fig - key[b].fig || key[a].band - key[b].band || key[a].tie - key[b].tie || a - b;
     // Strokes covering each cell, as a linked list over (cell -> first entry, entry -> next).
     const head = new Int32Array(cells).fill(-1), next: number[] = [], who: number[] = [];
     strokes.forEach((t, k) => { for (const c of t.cells) { next.push(head[c]); who.push(k); head[c] = who.length - 1; } });
@@ -415,8 +487,15 @@ export class Planner {
     return { turnDeg: L.maxTurnDeg, fine: false, lenMul: 1 };
   }
 
-  private trace(x0: number, y0: number, W: number, L: LayerSpec, ref: Grid, flow: Grid, cosTurn: number, lenMul = 1): Traced | null {
+  private trace(x0: number, y0: number, W: number, L: LayerSpec, ref: Grid, flow: Grid, cosTurn: number, lenMul = 1, level: Regions | null = null): Traced | null {
     const { gw, gh, cell } = this;
+    // The form this stroke belongs to; it may not leave it.
+    const lab0 = level ? level.label[Math.min(gh - 1, Math.max(0, Math.floor(y0))) * gw + Math.min(gw - 1, Math.max(0, Math.floor(x0)))] : -1;
+    // Distance to the nearest other shape: the blade may reach into it only by its margin.
+    const insetAt = (x: number, y: number) => clearance(level!, Math.min(gh - 1, Math.max(0, Math.floor(y))) * gw + Math.min(gw - 1, Math.max(0, Math.floor(x))), lab0);
+    // A shape too narrow for this blade is left to a finer layer.
+    if (level && lab0 < 0) level = null;
+    if (level && insetAt(x0, y0) < FORM_FIT * W) return null;
     const h = W * STEP, minLen = L.minLenMm / cell, maxLen = Math.max(minLen * 1.05, L.maxLenMm * lenMul / cell);
     const col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
     let taken = 1;
@@ -426,7 +505,7 @@ export class Planner {
     const sides: number[][] = [[], []];
     const head = [[x0, y0, d0x, d0y], [x0, y0, -d0x, -d0y]];
     const alive = [true, true];
-    let len = 0;
+    let len = 0, atForm = false;
     const margin = W * 0.5;
     // Grow the two ends in turn, each stopping on its own. An end stops at the canvas edge or
     // where the colour changes. Below the minimum length it tolerates a larger colour change, and
@@ -472,6 +551,8 @@ export class Planner {
           }
         }
         if (e > tol) { alive[sIdx] = false; continue; }
+        // Stay inside the form, the blade overlapping its neighbours by at most a fifth of its width.
+        if (level && insetAt(nx, ny) < FORM_FIT * W) { alive[sIdx] = false; atForm = true; continue; }
         // Judge later steps against the running mean of the centreline, not the seed pixel alone:
         // in textured areas (foliage, broken rock) one pixel is a poor guide to the area's colour.
         taken++;
@@ -481,7 +562,8 @@ export class Planner {
         len += h;
       }
     }
-    if (len < minLen * 0.98) {
+    // A stroke that fills a small shape edge to edge may be short: a single press of the knife.
+    if (len < (atForm ? minLen * SHORT_PRESS : minLen * 0.98)) {
       if (L.threshold > 0) return null;
       // Coverage layers: extend straight on, alternating ends, to the minimum length.
       for (let sIdx = 0; len < minLen; sIdx ^= 1) {
@@ -545,12 +627,47 @@ export class Planner {
     return out;
   }
 
+  /** The colour a stroke is mixed in: the image's, or for the underpainting under 'oil', toned. */
+  private paintLab(t: Traced, L: LayerSpec): number[] {
+    return this.s.look === 'oil' && L.tool === 'bristle' && this.s.underTone > 0 ? mix3(t.lab, UNDER_TONE, this.s.underTone) : t.lab;
+  }
+
+  /**
+   * Colours across the blade along a path (grid coordinates, in travel order), from the blade end at
+   * -normal (node 0) to +normal: each the mean along the path at that offset, re-centred on the
+   * stroke's colour and limited to a moderate departure from it.
+   */
+  private profile(pts: number[], W: number, lab: number[]): number[][] {
+    const R = this.profRef!, n = pts.length >> 1, acc = Array.from({ length: PROFILE }, () => [0, 0, 0]);
+    let cnt = 0;
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      let tx = pts[b * 2] - pts[a * 2], ty = pts[b * 2 + 1] - pts[a * 2 + 1];
+      const tl = Math.sqrt(tx * tx + ty * ty);
+      if (tl < 1e-9) continue;
+      tx /= tl; ty /= tl;
+      for (let k = 0; k < PROFILE; k++) {
+        const q = ((k + 0.5) / PROFILE - 0.5) * W * 0.85, x = pts[i * 2] - ty * q, y = pts[i * 2 + 1] + tx * q;
+        for (let c = 0; c < 3; c++) acc[k][c] += sampleE(R, x, y, c);
+      }
+      cnt++;
+    }
+    if (!cnt) return [lab];
+    const mean = [0, 0, 0];
+    for (const v of acc) for (let c = 0; c < 3; c++) { v[c] /= cnt; mean[c] += v[c] / PROFILE; }
+    return acc.map((v) => {
+      const d = [v[0] - mean[0], v[1] - mean[1], v[2] - mean[2]], m = Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      const k = m > 0.1 ? 0.1 / m : 1;
+      return [lab[0] + d[0] * k, lab[1] + d[1] * k, lab[2] + d[2] * k];
+    });
+  }
+
   /** Write the stroke's colour into the canvas estimate. */
   private stamp(t: Traced, l: number): void {
     const L = this.s.layers[l];
     // Thin underpainting lets some of what is below show through; loaded knife paint covers.
     const alpha = L.tool === 'bristle' ? 0.8 : 0.92;
-    const [r, g, b] = labToLinear(mix3(t.lab, t.alt, 0.25));
+    const [r, g, b] = labToLinear(mix3(this.paintLab(t, L), t.alt, 0.25));
     for (const i of t.cells) {
       const d = this.current.data;
       d[i * 3] += (r - d[i * 3]) * alpha; d[i * 3 + 1] += (g - d[i * 3 + 1]) * alpha; d[i * 3 + 2] += (b - d[i * 3 + 2]) * alpha;
@@ -744,7 +861,8 @@ export class Planner {
     return {
       index, layer: l, tool: l * FAMILIES + colourFamily(t.lab), points: path, footprint,
       widthMm: L.widthMm, lengthMm,
-      primary: labToSrgb(t.lab, s.chroma), secondary: labToSrgb(mix3(t.lab, t.alt, 0.7), s.chroma),
+      primary: labToSrgb(this.paintLab(t, L), s.chroma), secondary: labToSrgb(mix3(this.paintLab(t, L), t.alt, 0.7), s.chroma),
+      ...(this.profRef && L.tool === 'knife' ? { profile: this.profile(pts, W, t.lab).map((c) => labToSrgb(c, s.chroma)), mix: MIX[shape.primitive] } : {}),
       secondaryFraction: 0.12 + 0.3 * clamp01(t.spread / (L.tolerance * 1.5)),
       volumePerNode: Math.max(pitch * gap * lengthMm * s.loadFactor, yieldVolume(L.tool, pitch, lengthMm) * minLoad) * (0.9 + 0.2 * h1),
       gapMm: gap, pressMm: shape.press, wipe: 0.9 + 0.08 * h2,
@@ -826,6 +944,26 @@ function simplify(pts: number[], k: number): Vec2[] {
     while (j < n - 2 && cum[j + 1] < target) j++;
     const seg = cum[j + 1] - cum[j], f = seg > 0 ? (target - cum[j]) / seg : 0;
     out.push([pts[j * 2] + (pts[j * 2 + 2] - pts[j * 2]) * f, pts[j * 2 + 1] + (pts[j * 2 + 3] - pts[j * 2 + 1]) * f]);
+  }
+  return out;
+}
+
+/**
+ * A direction field that also follows forms: image edges weighted by their coherence, the form's
+ * principal axis weighted by its elongation, and the form's contour near its boundary (within
+ * about a blade width). All in doubled-angle form, so opposite signs agree.
+ */
+function formFlow(flow: Grid, level: FormLevel, W: number, axisWeight: number): Grid {
+  const n = flow.w * flow.h, out = makeGrid(flow.w, flow.h, 4);
+  for (let i = 0; i < n; i++) {
+    const f = level.label[i], coh = flow.data[i * 4 + 2];
+    const wImg = 0.25 + coh, wAxis = axisWeight * level.elongation[f] * level.elongation[f] * 1.5;
+    const wCont = 1.2 * (1 - smoothstep(level.inset[i] / (1.2 * W)));
+    let c = flow.data[i * 4] * wImg + level.axis[f * 2] * wAxis + level.contour[i * 2] * wCont;
+    let s = flow.data[i * 4 + 1] * wImg + level.axis[f * 2 + 1] * wAxis + level.contour[i * 2 + 1] * wCont;
+    const m = Math.sqrt(c * c + s * s);
+    if (m > 1e-12) { c /= m; s /= m; } else { c = flow.data[i * 4]; s = flow.data[i * 4 + 1]; }
+    out.data[i * 4] = c; out.data[i * 4 + 1] = s; out.data[i * 4 + 2] = coh; out.data[i * 4 + 3] = flow.data[i * 4 + 3];
   }
   return out;
 }

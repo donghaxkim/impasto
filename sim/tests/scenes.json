@@ -1,0 +1,34 @@
+{
+  "lake": {
+    "image": "tests/fixtures/lake.png", "widthMm": 360,
+    "crops": [
+      { "name": "mountains", "x0": 0.27, "y0": 0.02, "x1": 0.47, "y1": 0.32 },
+      { "name": "spruce", "x0": 0.355, "y0": 0.12, "x1": 0.435, "y1": 0.62 },
+      { "name": "lake", "x0": 0.06, "y0": 0.42, "x1": 0.32, "y1": 0.72 }
+    ]
+  },
+  "flowers": {
+    "image": "scenes/flowers.png", "widthMm": 340,
+    "crops": [
+      { "name": "gerbera", "x0": 0.27, "y0": 0.3, "x1": 0.66, "y1": 1.0 },
+      { "name": "carnation", "x0": 0.62, "y0": 0.52, "x1": 0.97, "y1": 1.0 },
+      { "name": "sprigs", "x0": 0.24, "y0": 0.0, "x1": 0.56, "y1": 0.45 }
+    ]
+  },
+  "building": {
+    "image": "scenes/building.png", "widthMm": 300,
+    "crops": [
+      { "name": "overhang", "x0": 0.12, "y0": 0.25, "x1": 0.52, "y1": 0.62 },
+      { "name": "grid", "x0": 0.55, "y0": 0.3, "x1": 0.95, "y1": 0.68 },
+      { "name": "dark-grid", "x0": 0.2, "y0": 0.6, "x1": 0.6, "y1": 1.0 }
+    ]
+  },
+  "portrait": {
+    "image": "scenes/portrait.png", "widthMm": 200,
+    "crops": [
+      { "name": "eye", "x0": 0.1, "y0": 0.24, "x1": 0.5, "y1": 0.44 },
+      { "name": "nose", "x0": 0.25, "y0": 0.42, "x1": 0.72, "y1": 0.66 },
+      { "name": "beard", "x0": 0.12, "y0": 0.6, "x1": 0.88, "y1": 0.92 }
+    ]
+  }
+}

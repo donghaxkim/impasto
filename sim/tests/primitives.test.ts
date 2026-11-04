@@ -138,3 +138,24 @@ test('deposition: locked is the default and paints exactly as before', () => {
   const a = mark(10, 30), b = mark(10, 30, { deposition: 'locked', attackDeg: 70, speed: 3 });
   assert.equal(fingerprint(a.canvas), fingerprint(b.canvas));
 });
+
+test('streaked load: colours across the blade land on their own side, and paint is conserved', () => {
+  const DARK = [0.15, 0.1, 0.1] as const, LIGHT = [0.95, 0.9, 0.85] as const;
+  const canvas = new PaintCanvas(60, 40, 0.1, GROUND, 3);
+  const tool = new Tool({ kind: 'knife', widthMm: 10, nodes: 120, seed: 7 });
+  tool.loadProfile(6 * yieldVolume('knife', tool.pitch, 40), [DARK, DARK, LIGHT, LIGHT, LIGHT], CREAM, 0.12, 0.3, 5);
+  paintStroke(canvas, tool, { points: [[10, 20], [23, 20], [37, 20], [50, 20]], gapMm: 0.45, seed: 99, deposition: 'physical' });
+  const held = canvas.totalVolume() + canvas.lost + tool.residual() + tool.wiped;
+  assert.ok(Math.abs(tool.loaded - held) / tool.loaded < 1e-9, 'volume conserved');
+  // Travelling +x, node 0 is at -y: the dark end is the upper side (smaller y).
+  const lightness = (y0: number, y1: number) => {
+    let s = 0, n = 0;
+    for (let y = Math.round(y0 / 0.1); y < Math.round(y1 / 0.1); y++) for (let x = 200; x < 400; x++) {
+      const c = y * canvas.w + x;
+      if (canvas.top[c] > 0.05) { s += canvas.topP[c * 3] / canvas.top[c]; n++; }
+    }
+    return s / Math.max(1, n);
+  };
+  const upper = lightness(16, 18.5), lower = lightness(21.5, 24);
+  assert.ok(upper > lower * 1.3, `K/S upper ${upper.toFixed(3)} vs lower ${lower.toFixed(3)} (higher is darker)`);
+});

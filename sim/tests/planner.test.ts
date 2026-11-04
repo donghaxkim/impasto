@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { DEFAULT_SETTINGS, FAMILIES, labToLinear, Planner, planPainting, scaleLayers, type PlannedStroke, type PlanSettings } from '../src/planner.ts';
 import { directionAt, directionField, gaussBlur, makeGrid, sample, toOklab, type RgbImage } from '../src/image.ts';
 import { canvasColour, paintStrokes, startPainting } from '../src/execute.ts';
+import { clearance, regionsAtScale } from '../src/forms.ts';
 import { srgbToLinear } from '../src/pigment.ts';
 
 /** A small synthetic landscape: sky gradient, a dark peak, a lake band and a thin vertical tree. */
@@ -225,7 +226,7 @@ test('painting maps: silhouettes on the ridge and the tree, flat sky, more relie
 });
 
 test('primitives: flat areas get thin quiet strokes, structured ones thicker; the look sets the edge profile', () => {
-  const plan = planPainting(landscape(), SMALL), oil = planPainting(landscape(), { ...SMALL, look: 'oil' });
+  const plan = planPainting(landscape(), SMALL), oil = planPainting(landscape(), { ...SMALL, look: 'oil', underTone: 0 });
   const knives = plan.strokes.filter((st) => st.primitive !== 'underpaint');
   const kinds = new Set(knives.map((st) => st.primitive));
   for (const k of ['plane', 'mark', 'contour'] as const) assert.ok(kinds.has(k), `no ${k} strokes`);
@@ -238,6 +239,8 @@ test('primitives: flat areas get thin quiet strokes, structured ones thicker; th
   assert.ok(mean(sky, (st) => st.gapMm / SMALL.layers![st.layer].gapMm) < mean(rest, (st) => st.gapMm / SMALL.layers![st.layer].gapMm), 'sky paint is thinner');
   for (const st of plan.strokes) assert.equal(st.edgeFlaws, 1);
   assert.ok(oil.strokes.some((st) => st.edgeFlaws < 0.5));
+  // Untoned, the look changes the paint and not where it goes. (A toned underpainting changes what
+  // the later layers see, and so the plan.)
   assert.deepEqual(oil.strokes.map((st) => st.points), plan.strokes.map((st) => st.points), 'the look does not change the plan');
 });
 
@@ -325,4 +328,72 @@ test('planner and analysis code avoid engine-dependent math', () => {
     // The exponent operator has Math.pow's engine-dependent rounding too.
     assert.equal(src.match(/[\w)\]]\s*\*\*\s*[\w(]/g), null, `${f} uses **`);
   }
+});
+
+/** A pale ground with an upright dark-red ellipse in the middle, 15 x 25 mm at 120 mm wide. */
+function figure(w = 240, h = 160): RgbImage {
+  const data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const ex = (x - 120) / 15, ey = (y - 80) / 25, inside = ex * ex + ey * ey < 1;
+    data.set(inside ? [120, 30, 35] : [205 + Math.round(10 * y / h), 210, 220], (y * w + x) * 3);
+  }
+  return { w, h, data };
+}
+
+test('forms: nested shapes; broad knives stay out of a shape they do not fit and paint shapes along their axis', () => {
+  const img = figure(), planner = new Planner(img, { ...DEFAULT_SETTINGS, ...SMALL });
+  const [coarse, mid, fine] = planner.forms.levels;
+  assert.ok(coarse.count <= mid.count && mid.count <= fine.count, `${coarse.count} ${mid.count} ${fine.count}`);
+  // Nested: every fine shape lies inside one middle shape.
+  const parent = new Map<number, number>();
+  for (let i = 0; i < fine.label.length; i++) {
+    const p = parent.get(fine.label[i]);
+    if (p === undefined) parent.set(fine.label[i], mid.label[i]); else assert.equal(p, mid.label[i]);
+  }
+  // At a blade's scale: the figure binds a narrow blade (a core, with room for it) and binds nothing
+  // for a blade much wider than itself (freed); a faint ripple in the ground binds neither.
+  const centre = 80 * 240 + 120, W3 = 3 / 0.5, W40 = 40 / 0.5;
+  let checked = 0;
+  for (const L of planner.forms.levels) {
+    const r3 = regionsAtScale(L, 240, 160, 0.06, 1.5 * W3 * W3, 0.3 * W3), r40 = regionsAtScale(L, 240, 160, 0.06, 1.5 * W40 * W40, 0.3 * W40);
+    if (L.label[centre] === L.label[0]) continue; // a level too coarse to hold the figure
+    assert.ok(r3.label[centre] >= 0 && clearance(r3, centre, r3.label[centre]) > 0.3 * W3, 'the figure is a core for a 3 mm blade');
+    assert.ok(r40.label[centre] < 0 || r40.label[centre] === r40.label[0], 'a 40 mm blade is not bound by the figure');
+    const ground = new Set<number>();
+    for (let y = 0; y < 160; y += 4) for (let x = 0; x < 60; x += 4) ground.add(r3.label[y * 240 + x]);
+    assert.equal(ground.size, 1, 'the ground, 10 levels of grey from top to bottom, is one shape');
+    checked++;
+  }
+  assert.ok(checked >= 2, `the figure is its own shape at ${checked} levels`);
+  const plan = planPainting(img, SMALL);
+  const inEllipse = (x: number, y: number, grow: number) => { const ex = (x / 0.5 - 120) / (15 + grow), ey = (y / 0.5 - 80) / (25 + grow); return ex * ex + ey * ey < 1; };
+  let intruding = 0, figureStrokes = 0, vertical = 0;
+  for (const st of plan.strokes) {
+    if (st.primitive === 'underpaint' || st.primitive === 'contour') continue;
+    const red = st.primary[0] > st.primary[2] + 0.15;
+    if (!red && st.footprint.some(([x, y]) => inEllipse(x, y, -3))) intruding++;
+    if (red && st.footprint.every(([x, y]) => inEllipse(x, y, 2))) {
+      figureStrokes++;
+      const [ax, ay] = st.footprint[0], [bx, by] = st.footprint[st.footprint.length - 1];
+      if (Math.abs(by - ay) > Math.abs(bx - ax)) vertical++;
+    }
+  }
+  assert.equal(intruding, 0, 'ground strokes running through the figure');
+  assert.ok(figureStrokes >= 3, `${figureStrokes} figure strokes`);
+  // A flat upright shape has no edges inside to follow; its strokes follow its long axis.
+  assert.ok(vertical >= figureStrokes * 0.6, `${vertical} of ${figureStrokes} figure strokes run along its axis`);
+});
+
+test('pigment: under the oil look, knives carry the colours across their path; the underpainting is toned', () => {
+  const img = figure();
+  const plain = planPainting(img, { ...SMALL, look: 'oil', streaks: false }), oil = planPainting(img, { ...SMALL, look: 'oil' });
+  assert.ok(plain.strokes.every((st) => !st.profile));
+  const knives = oil.strokes.filter((st) => st.primitive !== 'underpaint');
+  assert.ok(knives.every((st) => st.profile && st.profile.length === 5 && st.mix! >= 0 && st.mix! <= 1));
+  // A stroke along the figure's edge has its two blade ends in different colours.
+  const spread = knives.map((st) => Math.abs(st.profile![0][0] - st.profile![4][0]) + Math.abs(st.profile![0][2] - st.profile![4][2]));
+  assert.ok(spread.some((d) => d > 0.08), `largest end-to-end difference ${Math.max(...spread).toFixed(3)}`);
+  const under = oil.strokes.filter((st) => st.primitive === 'underpaint'), locked = planPainting(img, SMALL).strokes.filter((st) => st.primitive === 'underpaint');
+  const lum = (s: PlannedStroke[]) => s.reduce((a, st) => a + st.primary[0] + st.primary[1] + st.primary[2], 0) / s.length;
+  assert.ok(lum(under) < lum(locked) - 0.1, `toned ${lum(under).toFixed(2)} vs ${lum(locked).toFixed(2)}`);
 });
