@@ -20,10 +20,10 @@ import { DEFAULT_SNAPSHOT_MAX_SIDE, snapshotFactor, strokesToJSON, surfaceSnapsh
 export type { ImpastoSurface } from './surface.ts';
 export type { LightSettings, LookName } from './relight.ts';
 export type { Plan, PlanSettings, PlannedStroke, LayerSpec } from './planner.ts';
-export { DEFAULT_LIGHT } from './relight.ts';
+export { DEFAULT_LIGHT, relightSurface } from './relight.ts';
 export { DEFAULT_SETTINGS } from './planner.ts';
 export { PRESETS, PRESET_NAMES, resolvePreset, type PresetName, type Preset } from './presets.ts';
-export { surfaceFromCanvas, encodeSurface, decodeSurface, SURFACE_VERSION } from './surface.ts';
+export { surfaceFromCanvas, encodeSurface, decodeSurface, SURFACE_VERSION, SURFACE_FLAG_OCCLUSION, type EncodeSurfaceOptions } from './surface.ts';
 export { DEFAULT_SNAPSHOT_MAX_SIDE, downsampleSurface, snapshotFactor, strokesToJSON, type ImpastoStroke, type Rgb01 } from './snapshot.ts';
 
 // ---------------------------------------------------------------------------------------------
