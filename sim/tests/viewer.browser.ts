@@ -24,7 +24,8 @@ import { compareRgb, NO_WEBGPU_ARGS, parityCanvas, RENDER_IN_PAGE, startHarness,
 
 const NO_GPU = 'Object.defineProperty(Navigator.prototype, "gpu", { get: () => undefined, configurable: true });';
 const tiny = tinyCanvas();
-const tinyB64 = Buffer.from(encodeSurface(surfaceFromCanvas(tiny))).toString('base64');
+// Lossless (version 1) so the renderer is compared, not the quantised file format.
+const tinyB64 = Buffer.from(encodeSurface(surfaceFromCanvas(tiny), { version: 1 })).toString('base64');
 const tinyRef = relight(tiny, DEFAULT_LIGHT, 'paint');
 const tinyRefB64 = Buffer.from(tinyRef).toString('base64');
 const rgbToRgba = (rgb: Uint8ClampedArray) => { const o: number[] = []; for (let i = 0; i < rgb.length; i += 3) o.push(rgb[i], rgb[i + 1], rgb[i + 2], 255); return o; };
@@ -42,7 +43,7 @@ describe('WebGPU path', () => {
 
   test('matches the CPU reference renderer (both looks, another light, colour view)', async (t) => {
     if (!gpuOk) return t.skip('no WebGPU');
-    const c = parityCanvas(), surfaceB64 = Buffer.from(encodeSurface(surfaceFromCanvas(c))).toString('base64');
+    const c = parityCanvas(), surfaceB64 = Buffer.from(encodeSurface(surfaceFromCanvas(c), { version: 1 })).toString('base64');
     for (const { name, light, view } of PARITY_CASES) {
       const r = await page.evaluate(RENDER_IN_PAGE, { surfaceB64, opts: {}, light, view });
       assert.equal(r.mode, 'webgpu', r.reason);

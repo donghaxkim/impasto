@@ -47,7 +47,7 @@ const viewer = await createImpastoViewer(canvasEl, result.surface, { look: resul
 attachPointerLight(viewer);
 ```
 
-`impasto-sim/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `impasto-sim`) save and load a result's `surface` as an `.impasto` file. The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
+`impasto-sim/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `impasto-sim`) save and load a result's `surface` as an `.impasto` file (quantised version 2, about 6 bytes per cell; `{ version: 1 }` for lossless floats, see `.impasto` files). The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
 
 - **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes`, and `timings` in ms.
 - **Presets** (`src/presets.ts`), each a few overrides on `DEFAULT_SETTINGS` and `DEFAULT_LIGHT`, so planner defaults flow through:
@@ -96,7 +96,7 @@ Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan →
 
 - `src/tool.ts`: tool nodes, plowing, wet exchange, stiction and the terminal heap.
 - `src/canvas.ts`: canvas weave, two paint layers per cell, mass-conserving moves and slumping.
-- `src/relight.ts`: the reference renderer, with GGX clearcoat, ray-marched shadows and horizon occlusion.
+- `src/relight.ts`: the reference renderer, with GGX clearcoat, ray-marched shadows and horizon occlusion; `relight(canvas)`, or `relightSurface(surface)` for a packed or decoded surface.
 - `src/relight-gpu.ts`: WebGPU port of the renderer.
 - `src/surface.ts`: `ImpastoSurface`, the packed height and colour buffers a renderer needs, and the `.impasto` file format.
 - `src/viewer.ts`: the browser viewer (live WebGPU relighting with a static fallback); `src/viewer-bundle.ts` inlines it into pages.
@@ -130,7 +130,32 @@ viewer.destroy();
 
 ### `.impasto` files
 
-`encodeSurface(s)` / `decodeSurface(bytes)` in `surface.ts`, so a site can ship prerendered paintings. Little-endian, version 1: 8-byte magic `IMPASTO\x1a`, u32 version, u32 header size (48; data starts there, so a later version can grow the header), u32 w, u32 h, u32 flags (0), u32 reserved, f64 dx, f64 maxH, then `height` (w·h·2 f32) and `color` (w·h·4 f32), bit-exact. That is 24 bytes per cell: 26 MB for 120 x 90 mm at 0.1 mm, 233 MB for 360 x 270 mm. gzip only saves about 12% on these floats; a quantised version 2 (f16 or 16-bit heights) is the obvious next step if files must be small.
+`encodeSurface(s, opts?)` / `decodeSurface(bytes)` in `surface.ts`, so a site can ship prerendered paintings. `encodeSurface` writes version 2 (quantised) unless given `{ version: 1 }` (lossless); `decodeSurface` reads both and throws a clear error on a wrong magic, gzip data, an unknown version or flag, a truncated or oversized file, or corrupt header ranges. The same surface always gives the same bytes, and decoding gives the same floats on every engine (plain arithmetic and table lookups, no `Math.pow`).
+
+All versions are little-endian and share the first 48 bytes: 8-byte magic `IMPASTO\x1a`, u32 version, u32 header size (data starts there, so a version can grow its header), u32 w, u32 h, u32 flags, u32 reserved, f64 dx, f64 maxH.
+
+**Version 2** (default), 6 bytes per cell: header size 96, then f64 ranges at byte 48: visible height min, max (mm); occlusion min, max (0, 0 unless stored); roughness min, max. Then planes of w·h values, row-major:
+
+| plane | encoding |
+| --- | --- |
+| visible height | u16, `round((v - min) / (max - min) · 65535)`: the w·h low bytes, then the w·h high bytes |
+| occlusion height | only when flag bit 0 is set; u16 as above. Otherwise the decoder rebuilds it from the visible height with `occlusionFilter` (`relight.ts`), which is how `surfaceFromCanvas` makes it |
+| albedo r, g, b | u8 each: the sRGB transfer of the linear value (clamped to 0..1), to the nearest code; decoded through a 256-entry `srgbToLinear` table |
+| roughness | u8, `round((v - min) / (max - min) · 255)` |
+
+Every plane is stored with PNG's Sub filter (within a row, each value minus its left neighbour, modulo 2^16 for heights, before the byte split, or 2^8; the first value of a row as is), which roughly halves the gzipped size. The encoder checks whether the surface's occlusion channel is what the decoder would rebuild (within 1/2^20 of the height range); if not, it sets flag bit 0 and stores it (8 bytes per cell).
+
+Measured on the lake painted at 120 mm (1200 x 577 cells): height error at most half a step (5e-5 mm over a 6.4 mm range), rebuilt occlusion within 2.3e-5 mm. Relit with `relightSurface` against the lossless surface, the mean difference is 0.21 of an 8-bit level at the default light and 0.18 at a 10° grazing light (both looks), almost all from the 8-bit albedo; the maximum (up to about 100 levels) is a handful of pinpoint crest glints, 0.001% of channels, whose very narrow lobes flip with a sub-micron height change. Roughness at 8 bits adds under 0.001 of a level. The colour view differs by 0.5 on average because `relight` writes `x · 255 + 0.5` into a clamped array, and decoded albedo sits exactly on its rounding ties; it is never off by more than 1.
+
+**Version 1** (legacy, lossless), 24 bytes per cell: header size 48, flags 0, then `height` (w·h·2 f32) and `color` (w·h·4 f32), bit-exact. `npm run gpu-parity` and `test:viewer` use it so they compare renderers, not the file format.
+
+| canvas at 0.1 mm | cells | v1 | v1 gzip | v2 | v2 gzip | v2 brotli |
+| --- | --- | --- | --- | --- | --- | --- |
+| lake, 120 x 58 mm (measured) | 0.69 M | 16.6 MB | 14.3 MB | 4.2 MB | 1.9 MB | 1.7 MB |
+| 120 x 90 mm | 1.08 M | 26 MB | about 22 MB | 6.5 MB | about 3.0 MB | about 2.7 MB |
+| 360 x 270 mm | 9.72 M | 233 MB | about 200 MB | 58 MB | about 27 MB | about 24 MB |
+
+The compressed sizes for 120 x 90 and 360 x 270 scale the lake's per cell (v2: 2.7 bytes gzip -9, 2.8 at the default level, 2.5 brotli); busier paintings compress less. The demo pages open `.impasto.gz` (`gzip -k out/lake.impasto`); a server can also send `.impasto` with `Content-Encoding: gzip` or `br`.
 
 ### Demo pages
 

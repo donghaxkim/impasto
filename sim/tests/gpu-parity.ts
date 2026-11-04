@@ -18,7 +18,7 @@ export const PARITY_CASES: { name: string; light: LightSettings; view: View }[] 
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const c = parityCanvas();
-  const surfaceB64 = Buffer.from(encodeSurface(surfaceFromCanvas(c))).toString('base64');
+  const surfaceB64 = Buffer.from(encodeSurface(surfaceFromCanvas(c), { version: 1 })).toString('base64'); // lossless: compare renderers, not the file format
   const h = await startHarness(WEBGPU_ARGS);
   const page = await h.page();
   let worst = 0;

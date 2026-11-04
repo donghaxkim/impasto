@@ -1,5 +1,6 @@
 import { clamp, dcos, dsin, hash, radians, smooth } from './dmath.ts';
 import type { PaintCanvas } from './canvas.ts';
+import type { ImpastoSurface } from './surface.ts';
 import { linearToSrgb, reflectanceFromKs } from './pigment.ts';
 
 export interface LightSettings {
@@ -69,10 +70,19 @@ export function surfaceField(c: PaintCanvas, relief = 1): Float64Array {
 
 /** Height used for shadow and occlusion queries. Filtering it feathers the kernel, so a one-cell wall can't print a hard line. */
 export function occlusionField(c: PaintCanvas, relief = 1): Float64Array {
-  const { w, h, dx } = c, r = Math.max(1, Math.round(0.22 / dx));
-  let src = surfaceField(c, relief);
+  return occlusionFilter(surfaceField(c, relief), c.w, c.h, c.dx);
+}
+
+/**
+ * The filter behind occlusionField, on any visible height field: two box passes of radius 0.22 mm.
+ * Plain sums and divisions, so it gives the same bits on every engine (`.impasto` version 2
+ * rebuilds the occlusion channel with it on decode).
+ */
+export function occlusionFilter(S: ArrayLike<number>, w: number, h: number, dx: number): Float64Array {
+  const n = w * h, r = Math.max(1, Math.round(0.22 / dx));
+  let src: ArrayLike<number> = S;
   for (let pass = 0; pass < 2; pass++) {
-    const tmp = new Float64Array(c.n), out = new Float64Array(c.n);
+    const tmp = new Float64Array(n), out = new Float64Array(n);
     for (let y = 0; y < h; y++) {
       let sum = 0;
       for (let x = -r; x <= r; x++) sum += src[y * w + (x < 0 ? 0 : x >= w ? w - 1 : x)];
@@ -93,7 +103,7 @@ export function occlusionField(c: PaintCanvas, relief = 1): Float64Array {
     }
     src = out;
   }
-  return src;
+  return src as Float64Array;
 }
 
 export function albedoField(c: PaintCanvas): Float32Array {
@@ -112,10 +122,25 @@ export function albedoField(c: PaintCanvas): Float32Array {
 }
 
 export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, view: View = 'paint'): Uint8ClampedArray {
-  const { w, h, dx, n } = c;
-  const S = surfaceField(c, light.relief);
-  const O = occlusionField(c, light.relief);
-  const A = albedoField(c);
+  return relightFields(c.w, c.h, c.dx, surfaceField(c, light.relief), occlusionField(c, light.relief), albedoField(c), c.rough, light, view);
+}
+
+/**
+ * The same renderer on a packed surface (`ImpastoSurface`, e.g. a decoded `.impasto` file)
+ * instead of a live canvas. Heights are float32 there, so it can differ from relight() on the
+ * canvas by rounding, far below an 8-bit level.
+ */
+export function relightSurface(s: ImpastoSurface, light: LightSettings = DEFAULT_LIGHT, view: View = 'paint'): Uint8ClampedArray {
+  const n = s.w * s.h, S = new Float64Array(n), O = new Float64Array(n), A = new Float32Array(n * 3), rough = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    S[i] = s.height[i * 2] * light.relief; O[i] = s.height[i * 2 + 1] * light.relief;
+    A[i * 3] = s.color[i * 4]; A[i * 3 + 1] = s.color[i * 4 + 1]; A[i * 3 + 2] = s.color[i * 4 + 2]; rough[i] = s.color[i * 4 + 3];
+  }
+  return relightFields(s.w, s.h, s.dx, S, O, A, rough, light, view);
+}
+
+function relightFields(w: number, h: number, dx: number, S: Float64Array, O: Float64Array, A: Float32Array, rough: Float32Array, light: LightSettings, view: View): Uint8ClampedArray {
+  const n = w * h;
   const out = new Uint8ClampedArray(n * 3);
   const az = radians(light.azimuth), el = radians(light.elevation);
   const cel = dcos(el), sel = dsin(el), lx = dcos(az) * cel, ly = dsin(az) * cel, lz = sel;
@@ -255,7 +280,7 @@ export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, vi
       const xp = x + 1 < w ? i + 1 : i, xm = x > 0 ? i - 1 : i, yp = y + 1 < h ? i + w : i, ym = y > 0 ? i - w : i;
       const dg1 = GX[xp] - GX[xm], dg2 = GX[yp] - GX[ym], dg3 = GY[xp] - GY[xm], dg4 = GY[yp] - GY[ym];
       const changeSq = dg1 * dg1 + dg2 * dg2 + dg3 * dg3 + dg4 * dg4, change = Math.sqrt(changeSq);
-      const coat0 = clearcoatRoughness(c.rough[i], change, x, y), coat = coat0 > look.coatMin ? coat0 : look.coatMin;
+      const coat0 = clearcoatRoughness(rough[i], change, x, y), coat = coat0 > look.coatMin ? coat0 : look.coatMin;
       // A pixel covers a small range of normals. This keeps narrow lobes from vanishing between
       // pixels. The cap is low so the highlight stays a sharp point. Geometric specular AA adds the
       // normal's spread across the pixel to the lobe (sigma^2 = 1 / 2pi, kappa = 0.18).
