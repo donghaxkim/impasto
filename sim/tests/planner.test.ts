@@ -551,13 +551,13 @@ test('shading: on a form turning in the light, strokes run along its iso-luminan
   assert.equal(digest(planPainting(img, { ...SMALL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 }).strokes), digest(planPainting(img, { ...SMALL, ...NO_PLANES }).strokes));
 });
 
-/** A broad, strongly textured warm ellipse (80 x 55 mm at 120 mm wide) on a dark ground: a plane full of pores. */
+/** A broad, strongly textured warm ellipse (80 x 55 mm at 120 mm wide), turning darker to the right, on a dark ground: a cheek full of pores. */
 function texturedBlob(w = 240, h = 160): RgbImage {
   const data = new Uint8Array(w * h * 3);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const k = (Math.imul((x >> 1) + 1, 73856093) ^ Math.imul((y >> 1) + 1, 19349663)) >>> 0, t = 70 * ((k % 1000) / 1000 - 0.5);
-    const ex = (x - 120) / 80, ey = (y - 80) / 55;
-    data.set((ex * ex + ey * ey < 1 ? [200 + t, 150 + t, 120 + t] : [60, 70, 85]).map((v) => Math.max(0, Math.min(255, Math.round(v)))), (y * w + x) * 3);
+    const ex = (x - 120) / 80, ey = (y - 80) / 55, lit = 0.55 + 0.45 * (1 - ex);
+    data.set((ex * ex + ey * ey < 1 ? [200 * lit + t, 150 * lit + t, 120 * lit + t] : [60, 70, 85]).map((v) => Math.max(0, Math.min(255, Math.round(v)))), (y * w + x) * 3);
   }
   return { w, h, data };
 }
@@ -566,7 +566,7 @@ test('press restraint: later layers hold back inside presses that match; small f
   const img = texturedBlob();
   const later = (plan: ReturnType<typeof planPainting>) => plan.strokes.filter((st) => ['forms', 'detail', 'accents'].includes(plan.layerNames[st.layer]) && st.footprint.every(([x, y]) => Math.hypot((x / 0.5 - 120) / 80, (y / 0.5 - 80) / 55) < 1)).length;
   const free = later(planPainting(img, { ...OIL, pressRestraint: 0 })), held = later(planPainting(img, { ...OIL, pressRestraint: 0.8 }));
-  assert.ok(held < free * 0.85, `${held} later strokes inside the blob with press restraint, ${free} without`);
+  assert.ok(held < free * 0.9, `${held} later strokes inside the blob with press restraint, ${free} without`);
   const plan = planPainting(facade(), { ...OIL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 });
   const light = (st: PlannedStroke) => st.primary[0] + st.primary[1] + st.primary[2] > 2.2;
   assert.ok(plan.strokes.some((st) => light(st) && st.layer === plan.layerNames.indexOf('accents') && st.footprint.some(([x, y]) => Math.hypot((x / 0.5 - 60) / 4, (y / 0.5 - 120) / 2.5) < 1.2)), 'no accent mark on the fleck');

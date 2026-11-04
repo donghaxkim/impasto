@@ -342,6 +342,8 @@ const SHADE_MIN_MM = 4, SHADE_GRAD = 0.004;
 const BAND_CUE = 0.3;
 /** Share of a shape on a strong shading cue for it to be pressed as planes (see planPresses). */
 const PLANE_SHARE = 0.1;
+/** A plane on a smooth form ignores texture finer than itself, but stops at a difference this many tolerances strong. */
+const LINE_TOL = 2.5;
 /** A warm dark (burnt-sienna-like, OKLab) that the underpainting is toned toward. */
 const UNDER_TONE = [0.42, 0.05, 0.07];
 
@@ -733,7 +735,8 @@ export class Planner {
         for (let q = 0; q < sizes.length; q++) {
           if (sizes[q] / cell > 2.1 * bc) continue;
           const R = refOf(q), c = [sampleE(R, x0, y0, 0), sampleE(R, x0, y0, 1), sampleE(R, x0, y0, 2)];
-          if (q === 0 || across(R, x0, y0, sizes[q] / cell, c) <= L.tolerance) z = q;
+          // A plane may ignore texture finer than itself, never a strong line (a mullion, a hair).
+          if (q === 0 || (across(R, x0, y0, sizes[q] / cell, c) <= L.tolerance && (R === ref || across(ref, x0, y0, sizes[q] / cell, c) <= LINE_TOL * L.tolerance))) z = q;
         }
         if (z < 0) break;
         // The slivers between planes are left to the forms layer rather than filled with small presses.
@@ -752,6 +755,7 @@ export class Planner {
             if (x < 0 || y < 0 || x >= gw || y >= gh) break;
             const j = Math.floor(y) * gw + Math.floor(x);
             if (clearance(region, j, lb) < 0.4 * W || diffAt(R, x, y, col) > L.tolerance || (z > 0 && across(R, x, y, W, col) > L.tolerance * 1.4)) break;
+            if (R !== ref && (diffAt(ref, x, y, col) > LINE_TOL * L.tolerance || across(ref, x, y, W, col) > LINE_TOL * L.tolerance)) break;
             ends[side] = q; taken++;
             for (let k = 0; k < 3; k++) col[k] += (sampleE(R, x, y, k) - col[k]) / taken;
           }
@@ -768,10 +772,11 @@ export class Planner {
         // Marbling colour: the footprint sample farthest from the mean.
         let far = fp[0], farD = -1;
         for (const i of fp) { const dd = dist(ref.data, i * 3, col, 0); if (dd > farD) { farD = dd; far = i; } }
-        accepted.push({ pts, lab: col, alt: [ref.data[far * 3], ref.data[far * 3 + 1], ref.data[far * 3 + 2]], spread: Math.min(farD, L.tolerance * 1.5), len, cells: fp, w: W, size: z, press: true });
+        accepted.push({ pts, lab: col, alt: [ref.data[far * 3], ref.data[far * 3 + 1], ref.data[far * 3 + 2]], spread: Math.min(farD, L.tolerance * 1.5), len, cells: fp, w: W, size: z, press: true, ...(smoothForm ? { plane: true } : {}) });
         st.accepted++;
         if (sizes[z] > widest) widest = sizes[z];
-        if (hold) {
+        if (hold && planes) {
+          // Only planes of smooth forms hold (elsewhere, a lake, a facade, holding back cost edges).
           // Match at the press's own scale, and depth inside the press: full in its middle, none at its edges.
           const ax = x0 - d[0] * ends[1], ay = y0 - d[1] * ends[1];
           for (const i of fp) {
@@ -1060,6 +1065,11 @@ export class Planner {
     if (L.primitives === false || L.tool === 'bristle') {
       return shape({ primitive: 'underpaint', gap: 1, load: 1, press: 0, engage: 1, taper: [0, 0], taperMin: 0.2, breaks: 0, heap: 0.3, pressure: [1], attackDeg: 30, speed: 1 });
     }
+    if (t.press && t.plane) {
+      // A facet of a smooth form: laid flat and full, then lifted lightly, so the bead stays on the
+      // knife and the plane ends in a clean edge rather than a heap.
+      return shape({ primitive: 'press', gap: 0.85 + 0.3 * R, load: 1.3 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.5, breaks: 0, heap: 0.5, pressure: [0.85, jit(1.1), 1.15, 1, 0.25], attackDeg: 18 + 8 * h4, speed: 0.8 });
+    }
     if (t.press) {
       // One bold, loaded press laid flat and lifted into a heap: a facet, a petal.
       return shape({ primitive: 'press', gap: 0.85 + 0.3 * R, load: 1.5 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.5, breaks: 0, heap: 1.2, pressure: [0.85, jit(1.15), 1.2, 1.1, 0.5 + 0.4 * R], attackDeg: 20 + 10 * h4, speed: 0.75 });
@@ -1255,6 +1265,8 @@ interface Traced {
   pts: number[]; lab: number[]; alt: number[]; spread: number; len: number; cells: number[];
   /** Presses: blade width in cells and index into the layer's sizes. */
   w?: number; size?: number; press?: boolean;
+  /** A press on a value band of a smooth form: a facet, lifted lightly so it leaves no crusty heap. */
+  plane?: boolean;
   /** Seeded in a freed narrow part; a dedicated mark for a small feature. Both painted last. */
   thin?: boolean; feature?: boolean;
   /** Features: the share of the blade in contact, so the mark is as wide as the feature. */
