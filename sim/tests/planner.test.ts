@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { DEFAULT_SETTINGS, FAMILIES, labToLinear, Planner, planPainting, scaleLayers, type PlannedStroke, type PlanSettings } from '../src/planner.ts';
-import { directionAt, directionField, gaussBlur, makeGrid, sample, toOklab, type RgbImage } from '../src/image.ts';
+import { directionAt, directionField, gaussBlur, makeGrid, sample, shadingField, toOklab, type RgbImage } from '../src/image.ts';
 import { canvasColour, paintStrokes, startPainting } from '../src/execute.ts';
 import { clearance, regionsAtScale } from '../src/forms.ts';
 import { srgbToLinear } from '../src/pigment.ts';
@@ -292,6 +292,50 @@ test('direction field follows a straight edge and falls back to horizontal on fl
   assert.ok(d[0] > 0.999, `flat direction (${d[0].toFixed(3)}, ${d[1].toFixed(3)})`);
 });
 
+/** An OKLab grid from a lightness function (neutral grey), plus a little hashed texture of amplitude `tex`. */
+function lightnessGrid(w: number, h: number, L: (x: number, y: number) => number, tex = 0) {
+  const g = makeGrid(w, h, 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const k = (Math.imul(x + 1, 73856093) ^ Math.imul(y + 1, 19349663)) >>> 0;
+    g.data[(y * w + x) * 3] = L(x, y) + tex * ((k % 1000) / 1000 - 0.5);
+  }
+  return g;
+}
+
+test('shading direction: along a cylinder\'s axis, around a sphere\'s rings; no say on flat or textured areas', () => {
+  const d = new Float64Array(2);
+  // An upright cylinder lit from the left: lightness falls across x (a half cosine), constant along y.
+  const cyl = shadingField(lightnessGrid(160, 120, (x) => 0.35 + 0.4 * (1 - (x / 160) * (x / 160))), 8, 0.001);
+  let strong = 0;
+  for (let y = 20; y < 100; y += 10) for (let x = 40; x < 150; x += 10) {
+    const i = y * 160 + x;
+    directionAt(cyl, x, y, 0, 1, d);
+    assert.ok(Math.abs(d[1]) > 0.98, `cylinder direction at ${x},${y}: (${d[0].toFixed(3)}, ${d[1].toFixed(3)})`);
+    if (cyl.data[i * 4 + 2] > 0.8) strong++;
+  }
+  // The turn steepens to the right; past a third of the way its gradient is clearly significant.
+  assert.ok(strong >= 60, `${strong} of 88 cylinder samples with a strong cue`);
+  // A sphere lit from the front: lightness falls with the distance from its centre, so iso-luminance
+  // contours are rings and the direction is tangent to them.
+  const sph = shadingField(lightnessGrid(160, 160, (x, y) => { const r2 = ((x - 80) * (x - 80) + (y - 80) * (y - 80)) / (70 * 70); return 0.25 + 0.55 * Math.sqrt(Math.max(0, 1 - r2)); }), 6, 0.002);
+  let rings = 0, tot = 0;
+  for (let y = 20; y < 140; y += 8) for (let x = 20; x < 140; x += 8) {
+    const rx = x - 80, ry = y - 80, r = Math.sqrt(rx * rx + ry * ry);
+    if (r < 25 || r > 60) continue;
+    directionAt(sph, x, y, 0, 0, d);
+    tot++;
+    if (Math.abs(d[0] * rx + d[1] * ry) / r < 0.1 && sph.data[(y * 160 + x) * 4 + 2] > 0.5) rings++;
+  }
+  assert.ok(tot > 20 && rings >= tot * 0.95, `${rings} of ${tot} sphere samples along the rings`);
+  // Flat lightness: no cue. Strong fine texture over the same cylinder: the cue drops.
+  const flat = shadingField(lightnessGrid(80, 80, () => 0.6), 8, 0.002);
+  for (let i = 0; i < 80 * 80; i++) assert.equal(flat.data[i * 4 + 2], 0);
+  const rough = shadingField(lightnessGrid(160, 120, (x) => 0.35 + 0.4 * (1 - (x / 160) * (x / 160)), 0.5), 8, 0.001);
+  let mean = 0, meanCyl = 0;
+  for (let y = 20; y < 100; y++) for (let x = 40; x < 150; x++) { mean += rough.data[(y * 160 + x) * 4 + 2]; meanCyl += cyl.data[(y * 160 + x) * 4 + 2]; }
+  assert.ok(mean < meanCyl * 0.2, `textured weight ${(mean / 8800).toFixed(3)} against smooth ${(meanCyl / 8800).toFixed(3)}`);
+});
+
 test('OKLab round trip is accurate', () => {
   const lin = makeGrid(1, 1, 3);
   for (const c of [[0.02, 0.5, 0.9], [0.8, 0.1, 0.3], [0.5, 0.5, 0.5]]) {
@@ -462,6 +506,66 @@ test('thin bright features can go on last, over the paint around them; a small f
 
 test('small features: without deferral, a small bright fleck still gets a mark in its own colour', () => {
   const plan = planPainting(facade(), OIL);
+  const light = (st: PlannedStroke) => st.primary[0] + st.primary[1] + st.primary[2] > 2.2;
+  assert.ok(plan.strokes.some((st) => light(st) && st.layer === plan.layerNames.indexOf('accents') && st.footprint.some(([x, y]) => Math.hypot((x / 0.5 - 60) / 4, (y / 0.5 - 120) / 2.5) < 1.2)), 'no accent mark on the fleck');
+});
+
+/**
+ * A wide box (110 x 50 mm at 120 mm wide) turning in the light across x, with fine texture, on a
+ * dark ground. Its long axis is horizontal, the iso-luminance contours of its turn are vertical.
+ */
+function turningBox(w = 240, h = 160): RgbImage {
+  const data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const k = (Math.imul(x + 1, 73856093) ^ Math.imul(y + 1, 19349663)) >>> 0, tex = (k % 1000) / 1000 - 0.5;
+    const u = (x - 120) / 110;
+    let c = [70, 80, 95];
+    if (u > -1 && u < 1 && y > 30 && y < 130) { const lit = 0.15 + 0.85 * (1 - (u + 0.6) * (u + 0.6) / 2.6); c = [215 * lit + 30 * tex, 160 * lit + 30 * tex, 130 * lit + 30 * tex]; }
+    data.set(c.map((v) => Math.max(0, Math.min(255, Math.round(v)))), (y * w + x) * 3);
+  }
+  return { w, h, data };
+}
+
+test('shading: on a form turning in the light, strokes run along its iso-luminance contours and presses step down the turn', () => {
+  // Strokes centred on the turn (the box's darkening right part), and how many of them are upright.
+  const onTurn = (plan: ReturnType<typeof planPainting>) => {
+    let up = 0, all = 0, presses = 0, upPresses = 0;
+    for (const st of plan.strokes) {
+      if (st.primitive === 'underpaint' || st.primitive === 'contour') continue;
+      const f = st.footprint, m = f[Math.floor(f.length / 2)];
+      if (!(m[0] > 78 && m[0] < 112 && m[1] > 20 && m[1] < 60)) continue;
+      const vert = Math.abs(f[f.length - 1][1] - f[0][1]) > Math.abs(f[f.length - 1][0] - f[0][0]);
+      all++; if (vert) up++;
+      if (st.primitive === 'press') { presses++; if (vert) upPresses++; }
+    }
+    return { up, all, presses, upPresses };
+  };
+  const img = turningBox(), off = onTurn(planPainting(img, OIL)), shaded = onTurn(planPainting(img, { ...OIL, shading: 3 }));
+  const banded = onTurn(planPainting(img, { ...OIL, shading: 3, valueBands: 0.09 }));
+  assert.ok(shaded.up / shaded.all > off.up / off.all + 0.1 && shaded.up >= shaded.all * 0.85, `upright on the turn: ${off.up}/${off.all} without, ${shaded.up}/${shaded.all} with shading`);
+  // Value bands: the turn is covered by many presses, one per band and along it.
+  assert.ok(banded.presses >= 3 * Math.max(1, off.presses) && banded.upPresses >= banded.presses * 0.8, `presses on the turn: ${off.presses} without bands, ${banded.upPresses}/${banded.presses} upright with`);
+  // 'locked' ignores all of it.
+  assert.equal(digest(planPainting(img, { ...SMALL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 }).strokes), digest(planPainting(img, SMALL).strokes));
+});
+
+/** A broad, strongly textured warm ellipse (80 x 55 mm at 120 mm wide) on a dark ground: a plane full of pores. */
+function texturedBlob(w = 240, h = 160): RgbImage {
+  const data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const k = (Math.imul((x >> 1) + 1, 73856093) ^ Math.imul((y >> 1) + 1, 19349663)) >>> 0, t = 70 * ((k % 1000) / 1000 - 0.5);
+    const ex = (x - 120) / 80, ey = (y - 80) / 55;
+    data.set((ex * ex + ey * ey < 1 ? [200 + t, 150 + t, 120 + t] : [60, 70, 85]).map((v) => Math.max(0, Math.min(255, Math.round(v)))), (y * w + x) * 3);
+  }
+  return { w, h, data };
+}
+
+test('press restraint: later layers hold back inside presses that match; small features still get their marks', () => {
+  const img = texturedBlob();
+  const later = (plan: ReturnType<typeof planPainting>) => plan.strokes.filter((st) => ['forms', 'detail', 'accents'].includes(plan.layerNames[st.layer]) && st.footprint.every(([x, y]) => Math.hypot((x / 0.5 - 120) / 80, (y / 0.5 - 80) / 55) < 1)).length;
+  const free = later(planPainting(img, OIL)), held = later(planPainting(img, { ...OIL, pressRestraint: 0.8 }));
+  assert.ok(held < free * 0.85, `${held} later strokes inside the blob with press restraint, ${free} without`);
+  const plan = planPainting(facade(), { ...OIL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 });
   const light = (st: PlannedStroke) => st.primary[0] + st.primary[1] + st.primary[2] > 2.2;
   assert.ok(plan.strokes.some((st) => light(st) && st.layer === plan.layerNames.indexOf('accents') && st.footprint.some(([x, y]) => Math.hypot((x / 0.5 - 60) / 4, (y / 0.5 - 120) / 2.5) < 1.2)), 'no accent mark on the fleck');
 });

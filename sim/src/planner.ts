@@ -18,10 +18,10 @@
  */
 import { hash } from './dmath.ts';
 import { linearToSrgb, srgbToLinear, type RGB } from './pigment.ts';
-import { directionAt, directionField, gaussBlur, makeGrid, mergeFields, resampleLinear, sample, toOklab, oklab, type Grid, type RgbImage } from './image.ts';
+import { directionAt, directionField, gaussBlur, makeGrid, mergeFields, resampleLinear, sample, shadingField, toOklab, oklab, type Grid, type RgbImage } from './image.ts';
 import { yieldVolume, type ToolSpec, type Vec2 } from './tool.ts';
 import { mapAt, paintingMaps, type PaintingMaps } from './structure.ts';
-import { clearance, formHierarchy, regionsAtScale, type FormHierarchy, type FormLevel, type Regions } from './forms.ts';
+import { clearance, formHierarchy, regionsAtScale, splitRegions, type FormHierarchy, type FormLevel, type Regions } from './forms.ts';
 
 export interface LayerSpec {
   name: string;
@@ -170,6 +170,26 @@ export interface PlanSettings {
    * where it shows between knife strokes it reads as underpainting.
    */
   underTone: number;
+  /**
+   * With the 'oil' look: say of the shading direction (image.ts shadingField) in the form-aware
+   * direction blend. On smooth forms, where colour edges are weak, strokes then run along the
+   * iso-luminance contours of the form-scale lightness, across the turn of the form, so successive
+   * planes step down the turn instead of combing along noise. 0 is off.
+   */
+  shading: number;
+  /**
+   * With the 'oil' look and `shading`: step of the value bands (OKLab L) the press layer splits
+   * shapes into where the shading cue is strong, so each press lands on one band of the turn and
+   * successive presses step down it (faceting). 0 is off.
+   */
+  valueBands: number;
+  /**
+   * With the 'oil' look: how strongly the form-bound layers after the presses hold back inside a
+   * press (0-1), scaled by how well the press matches the image there and fading toward the press's
+   * edges, so broad planes stay clean and detail gathers at their edges. Small features (forms.ts)
+   * are exempt. 0 is off.
+   */
+  pressRestraint: number;
 }
 
 export interface PlannedStroke {
@@ -244,7 +264,7 @@ export const DEFAULT_LAYERS: LayerSpec[] = [
 export const DEFAULT_SETTINGS: PlanSettings = {
   widthMm: 240, layers: DEFAULT_LAYERS, seed: 1, analysisMm: 0.5,
   flatDirection: [1, 0], flatBias: 0.12, formWeight: 1.5, formSizesMm: [80, 35, 15], ground: [0.58, 0.47, 0.37], chroma: 1.06,
-  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3,
+  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3, shading: 0, valueBands: 0, pressRestraint: 0,
 };
 
 /** Scale every length in the layers, for canvases larger or smaller than ~240 mm. */
@@ -316,6 +336,10 @@ const FEATURE_MM = 5;
 const STRUCTURE_REF = 0.6;
 /** Colours sampled across the blade for a streaked load. */
 const PROFILE = 5;
+/** Smallest blur for the shading direction, mm, and the lightness gradient (OKLab L per mm) it starts to count at. */
+const SHADE_MIN_MM = 4, SHADE_GRAD = 0.004;
+/** Shading cue above which a shape is split into value bands for presses. */
+const BAND_CUE = 0.3;
 /** A warm dark (burnt-sienna-like, OKLab) that the underpainting is toned toward. */
 const UNDER_TONE = [0.42, 0.05, 0.07];
 
@@ -374,6 +398,44 @@ export class Planner {
     this.plan = { widthMm: s.widthMm, heightMm, tools, strokes: [], counts: [], stats: [], layerNames: s.layers.map((l) => l.name), knifeScale: this.knifeScale };
   }
 
+  /**
+   * The shading direction (image.ts shadingField) at the scale of a blade W cells wide: lightness
+   * blurred to half a blade, but never below 4 mm, where skin texture would take over. Null when off.
+   */
+  private shadeAt(W: number): Grid | null {
+    if (this.s.look !== 'oil' || !(this.s.shading > 0)) return null;
+    const sigma = Math.max(0.5 * W, SHADE_MIN_MM / this.cell), key = Math.round(sigma * 100);
+    let g = this.shadeCache.get(key);
+    if (!g) { g = shadingField(this.lab, sigma, SHADE_GRAD * this.cell); this.shadeCache.set(key, g); }
+    return g;
+  }
+  private readonly shadeCache = new Map<number, Grid>();
+  /**
+   * Per cell, after the press layer: how firmly a press holds it (0-1): the press's match to the
+   * image there times how far inside the press the cell lies. Read by pressRestraint.
+   */
+  private pressHold: Float64Array | null = null;
+
+  /**
+   * Value band per cell for splitRegions: form-scale lightness (blurred as for the shading direction
+   * at blade width W) quantised in steps of `valueBands`, centred on each shape's mean so a shape's
+   * own value sits in the middle of a band. Where the shading cue is weak (flat or textured areas),
+   * band 0: the shape is not split there.
+   */
+  private valueBands(region: Regions, shade: Grid, W: number): Int32Array {
+    const n = this.gw * this.gh, sigma = Math.max(0.5 * W, SHADE_MIN_MM / this.cell), Lg = makeGrid(this.gw, this.gh, 1);
+    for (let i = 0; i < n; i++) Lg.data[i] = this.lab.data[i * 3];
+    const Lb = gaussBlur(Lg, sigma).data, sum = new Map<number, number>(), cnt = new Map<number, number>();
+    for (let i = 0; i < n; i++) { const lb = region.label[i]; if (lb >= 0) { sum.set(lb, (sum.get(lb) ?? 0) + Lb[i]); cnt.set(lb, (cnt.get(lb) ?? 0) + 1); } }
+    const band = new Int32Array(n), step = this.s.valueBands;
+    for (let i = 0; i < n; i++) {
+      const lb = region.label[i];
+      if (lb < 0 || shade.data[i * 4 + 2] < BAND_CUE) continue;
+      band[i] = Math.floor((Lb[i] - sum.get(lb)! / cnt.get(lb)!) / step + 0.5);
+    }
+    return band;
+  }
+
   /** Plan one layer against `this.current`, append it to the plan, and update the estimate. */
   planLayer(l: number): PlannedStroke[] {
     if (this.s.layers[l].kind === 'press') return this.planPresses(l);
@@ -390,8 +452,9 @@ export class Planner {
     // Inside a form, strokes also follow the form itself: its axis where it is elongated, its contour
     // near its boundary, image edges where they are clear.
     const level = L.formLevel !== undefined && L.formLevel >= 0 && L.threshold > 0 && this.forms.levels.length ? this.forms.levels[Math.min(L.formLevel, this.forms.levels.length - 1)] : null;
-    const flowF = level ? formFlow(flow, level, W, 1) : flow;
-    const fineFlow = level ? formFlow(fineFlow0, level, W, 0.5) : fineFlow0;
+    const shade = level ? this.shadeAt(W) : null;
+    const flowF = level ? formFlow(flow, level, W, 1, shade, this.s.shading) : flow;
+    const fineFlow = level ? formFlow(fineFlow0, level, W, 0.5, shade, this.s.shading) : fineFlow0;
     // The shapes this blade respects: distinct in colour and big enough for it.
     const region = level ? regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W * W, OPEN * W) : null;
     const fit = FORM_FIT * W + 0.75;
@@ -409,6 +472,15 @@ export class Planner {
       const lb = region.label[i];
       // Small high-contrast features (the white of an eye, a catchlight) are never held back.
       if (lb >= 0 && this.forms.features.label[i] < 0) seedErr[i] *= 1 - this.s.restraint * smoothstep((clearance(region, i, lb) - W) / W);
+    }
+    // Inside a press that already matches the image, hold back further: the plane stays clean.
+    // It also counts as partly covered, so a stroke lying mostly inside such presses is dropped like
+    // one lying over strokes of its own layer.
+    let held: Float64Array | null = null;
+    if (this.pressHold && region && this.s.pressRestraint > 0 && L.detail > 0) {
+      held = new Float64Array(n);
+      for (let i = 0; i < n; i++) if (this.forms.features.label[i] < 0) held[i] = this.s.pressRestraint * this.pressHold[i];
+      for (let i = 0; i < n; i++) seedErr[i] *= 1 - held[i];
     }
 
     const covered = new Uint8Array(n);
@@ -443,12 +515,16 @@ export class Planner {
         if (covered[c.y * gw + c.x]) continue;
         st.seeds++;
         const style = this.seedStyle(c.x + 0.5, c.y + 0.5, L);
-        const t = this.trace(c.x + 0.5, c.y + 0.5, W, L, ref, style.fine ? fineFlow : flowF, style.turnDeg === L.maxTurnDeg ? cosTurn : cosDeg(style.turnDeg), style.lenMul, region);
+        // On a smooth form turning in the light, a plane stays straight: facets, not a curving ribbon.
+        const stiff = shade ? 1 - 0.7 * smoothstep((shade.data[(c.y * gw + c.x) * 4 + 2] - 0.2) / 0.5) : 1;
+        const turnDeg = style.turnDeg * stiff;
+        const t = this.trace(c.x + 0.5, c.y + 0.5, W, L, ref, style.fine ? fineFlow : flowF, turnDeg === L.maxTurnDeg ? cosTurn : cosDeg(turnDeg), style.lenMul, region);
         if (!t) { st.tooShort++; continue; }
         // A bristle brush has round ends; a knife has square ones.
         const fp = this.footprint(t.pts, W, L.tool === 'bristle');
         let cov = 0;
-        for (const i of fp) cov += covered[i];
+        if (held) for (const i of fp) cov += covered[i] ? 1 : held[i];
+        else for (const i of fp) cov += covered[i];
         // A fill pass takes any stroke that closes a hole, however much it overlaps.
         if (fill ? cov >= fp.length : cov > fp.length * L.coverSkip) { st.overlapping++; continue; }
         // Keep a stroke only if it brings the canvas closer to the reference (Learning to Paint's reward).
@@ -591,32 +667,52 @@ export class Planner {
     const level = this.forms.levels[Math.min(L.formLevel ?? 2, this.forms.levels.length - 1)];
     this.profRef = this.s.streaks ? toOklab(gaussBlur(this.lin, Math.max(0.6, 0.12 * W0))) : null;
     const base = gaussBlur(this.lab, 0.6);
+    const shade = this.shadeAt(W0 * 2);
     const flow = formFlow(mergeFields(
       directionField(base, L.flowBlur * W0 * 2, this.s.flatDirection, this.s.flatBias),
-      directionField(base, L.flowBlur * W0 * 6, this.s.flatDirection, this.s.flatBias), this.s.formWeight), level, W0 * 2, 0.6);
+      directionField(base, L.flowBlur * W0 * 6, this.s.flatDirection, this.s.flatBias), this.s.formWeight), level, W0 * 2, 0.6, shade, this.s.shading);
     // Nothing is freed for presses: a press never covers a thin shape (a mullion, a stem), however narrow.
-    const region = regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W0 * W0, 0);
+    let region = regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W0 * W0, 0);
+    // On smooth forms turning in the light, each shape is split into value bands: one press per band.
+    if (shade && this.s.valueBands > 0) region = splitRegions(region, gw, gh, this.valueBands(region, shade, W0 * 2), REGION_MIN * W0 * W0);
+    // On those smooth forms a knife judges its fit against the image at its own scale (a plane
+    // ignores skin texture finer than itself), so wider knives can take a band.
+    const planeRef = shade && this.s.valueBands > 0 ? sizes.map((sz) => toOklab(gaussBlur(this.lin, L.blur * sz / cell))) : null;
     const cur = toOklab(this.current), err = new Float64Array(n);
     for (let i = 0; i < n; i++) err[i] = dist(ref.data, i * 3, cur.data, i * 3);
     const members = new Map<number, number[]>();
     for (let i = 0; i < n; i++) { const lb = region.label[i]; if (lb >= 0) { let a = members.get(lb); if (!a) members.set(lb, (a = [])); a.push(i); } }
     const covered = new Uint8Array(n), d = new Float64Array(2);
+    const hold = this.s.pressRestraint > 0 ? (this.pressHold = new Float64Array(n)) : null;
     for (const lb of [...members.keys()].sort((a, b) => a - b)) {
       const cells = members.get(lb)!;
-      for (let tries = 0; tries < 32; tries++) {
+      // With value bands, a large shape (a whole face) gets enough presses to cover it, not just 32.
+      const maxTries = planeRef ? Math.max(32, Math.ceil(cells.length / (W0 * W0))) : 32;
+      let widest = 0;
+      for (let tries = 0; tries < maxTries; tries++) {
         let best = -1, bc = -1;
         for (const i of cells) if (!covered[i]) { const c = clearance(region, i, lb); if (c > bc) { bc = c; best = i; } }
         if (best < 0) break;
         const x0 = best % gw + 0.5, y0 = (best - (best % gw)) / gw + 0.5;
         directionAt(flow, x0 - 0.5, y0 - 0.5, 0, 0, d);
-        const col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
+        const smoothForm = !!planeRef && shade!.data[best * 4 + 2] >= BAND_CUE;
+        const refOf = (q: number) => (smoothForm ? planeRef![q] : ref);
+        let col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
         // The widest knife that spans the shape here and whose two edges still land on its colour
         // (a shape may hold structure finer than itself: petals in a flower head).
-        const across = (x: number, y: number, W: number) => Math.max(diffAt(ref, x - d[1] * W * 0.4, y + d[0] * W * 0.4, col), diffAt(ref, x + d[1] * W * 0.4, y - d[0] * W * 0.4, col));
+        const across = (R: Grid, x: number, y: number, W: number, c: number[]) => Math.max(diffAt(R, x - d[1] * W * 0.4, y + d[0] * W * 0.4, c), diffAt(R, x + d[1] * W * 0.4, y - d[0] * W * 0.4, c));
         let z = -1;
-        for (let q = 0; q < sizes.length; q++) if (sizes[q] / cell <= 2.1 * bc && (q === 0 || across(x0, y0, sizes[q] / cell) <= L.tolerance)) z = q;
+        for (let q = 0; q < sizes.length; q++) {
+          if (sizes[q] / cell > 2.1 * bc) continue;
+          const R = refOf(q), c = [sampleE(R, x0, y0, 0), sampleE(R, x0, y0, 1), sampleE(R, x0, y0, 2)];
+          if (q === 0 || across(R, x0, y0, sizes[q] / cell, c) <= L.tolerance) z = q;
+        }
         if (z < 0) break;
-        const W = sizes[z] / cell, h = W * STEP;
+        // With value bands, later presses in a shape stay comparable to its widest: the slivers
+        // between planes are left to the forms layer rather than filled with small presses.
+        if (planeRef && sizes[z] < 0.5 * widest) { const fp0 = this.footprint([x0, y0, x0 + d[0], y0 + d[1]], sizes[z] / cell); for (const i of fp0) covered[i] = 1; continue; }
+        const W = sizes[z] / cell, h = W * STEP, R = refOf(z);
+        if (smoothForm) col = [sampleE(R, x0, y0, 0), sampleE(R, x0, y0, 1), sampleE(R, x0, y0, 2)];
         st.seeds++;
         const ends = [0, 0], maxLen = PRESS_ASPECT * W;
         let taken = 1;
@@ -628,9 +724,9 @@ export class Planner {
             const q = ends[side] + h, x = x0 + d[0] * q * sg, y = y0 + d[1] * q * sg;
             if (x < 0 || y < 0 || x >= gw || y >= gh) break;
             const j = Math.floor(y) * gw + Math.floor(x);
-            if (clearance(region, j, lb) < 0.4 * W || diffAt(ref, x, y, col) > L.tolerance || (z > 0 && across(x, y, W) > L.tolerance * 1.4)) break;
+            if (clearance(region, j, lb) < 0.4 * W || diffAt(R, x, y, col) > L.tolerance || (z > 0 && across(R, x, y, W, col) > L.tolerance * 1.4)) break;
             ends[side] = q; taken++;
-            for (let k = 0; k < 3; k++) col[k] += (sampleE(ref, x, y, k) - col[k]) / taken;
+            for (let k = 0; k < 3; k++) col[k] += (sampleE(R, x, y, k) - col[k]) / taken;
           }
         }
         const len = ends[0] + ends[1];
@@ -647,6 +743,18 @@ export class Planner {
         for (const i of fp) { const dd = dist(ref.data, i * 3, col, 0); if (dd > farD) { farD = dd; far = i; } }
         accepted.push({ pts, lab: col, alt: [ref.data[far * 3], ref.data[far * 3 + 1], ref.data[far * 3 + 2]], spread: Math.min(farD, L.tolerance * 1.5), len, cells: fp, w: W, size: z, press: true });
         st.accepted++;
+        if (sizes[z] > widest) widest = sizes[z];
+        if (hold) {
+          // Match at the press's own scale, and depth inside the press: full in its middle, none at its edges.
+          const ax = x0 - d[0] * ends[1], ay = y0 - d[1] * ends[1];
+          for (const i of fp) {
+            const cx = i % gw + 0.5, cy = (i - (i % gw)) / gw + 0.5, rx = cx - ax, ry = cy - ay;
+            const along = rx * d[0] + ry * d[1], perp = rx * -d[1] + ry * d[0], ap = perp < 0 ? -perp : perp;
+            const depth = smoothstep((0.5 * W - ap) / (0.25 * W)) * smoothstep(along / (0.25 * W)) * smoothstep((len - along) / (0.25 * W));
+            const v = (1 - smoothstep(dist(R.data, i * 3, col, 0) / L.tolerance)) * depth;
+            if (v > hold[i]) hold[i] = v;
+          }
+        }
       }
     }
     return this.emit(l, accepted, ref, W0, st);
@@ -1199,9 +1307,11 @@ function simplify(pts: number[], k: number): Vec2[] {
 /**
  * A direction field that also follows forms: image edges weighted by their coherence, the form's
  * principal axis weighted by its elongation, and the form's contour near its boundary (within
- * about a blade width). All in doubled-angle form, so opposite signs agree.
+ * about a blade width). With `shade` (shadingField), also the iso-luminance direction, weighted by
+ * the shading cue and down where colour edges are coherent. All in doubled-angle form, so opposite
+ * signs agree.
  */
-function formFlow(flow: Grid, level: FormLevel, W: number, axisWeight: number): Grid {
+function formFlow(flow: Grid, level: FormLevel, W: number, axisWeight: number, shade: Grid | null = null, shadeGain = 0): Grid {
   const n = flow.w * flow.h, out = makeGrid(flow.w, flow.h, 4);
   for (let i = 0; i < n; i++) {
     const f = level.label[i], coh = flow.data[i * 4 + 2];
@@ -1209,6 +1319,11 @@ function formFlow(flow: Grid, level: FormLevel, W: number, axisWeight: number): 
     const wCont = 1.2 * (1 - smoothstep(level.inset[i] / (1.2 * W)));
     let c = flow.data[i * 4] * wImg + level.axis[f * 2] * wAxis + level.contour[i * 2] * wCont;
     let s = flow.data[i * 4 + 1] * wImg + level.axis[f * 2 + 1] * wAxis + level.contour[i * 2 + 1] * wCont;
+    if (shade && shadeGain > 0) {
+      // How the form turns in the light: strongest on smooth forms whose colour edges are weak.
+      const wShade = shadeGain * shade.data[i * 4 + 2] * (1 - smoothstep((coh - 0.3) / 0.4));
+      c += shade.data[i * 4] * wShade; s += shade.data[i * 4 + 1] * wShade;
+    }
     const m = Math.sqrt(c * c + s * s);
     if (m > 1e-12) { c /= m; s /= m; } else { c = flow.data[i * 4]; s = flow.data[i * 4 + 1]; }
     out.data[i * 4] = c; out.data[i * 4 + 1] = s; out.data[i * 4 + 2] = coh; out.data[i * 4 + 3] = flow.data[i * 4 + 3];

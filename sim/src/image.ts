@@ -185,6 +185,59 @@ export function directionField(lab: Grid, sigma: number, flat: readonly [number,
   return out;
 }
 
+/**
+ * Direction across the turn of a form, from how it turns in the light: along the iso-luminance
+ * contours of the image's lightness (OKLab L) blurred to form scale, so a stroke laid along it keeps
+ * one value and the next stroke steps down the turn (a knife painter's faceting).
+ *
+ * The cue is meant for smooth forms, where the colour structure tensor is weak or noisy (skin pores,
+ * fine wrinkles) and strokes would otherwise comb along arbitrary iso-lines. Its weight is the
+ * product of:
+ * - coherence of the blurred lightness gradient over the window (one clear turn, not a dimple);
+ * - smoothness: the share of the window's fine lightness-gradient energy that survives blurring
+ *   (about 1 for a pure ramp, near 0 for texture such as hair or foliage);
+ * - significance: the blurred gradient against `minGrad` (lightness per cell), so flat areas, where
+ *   any direction is noise, get no say.
+ *
+ * Result per cell: [c, s, weight, gradient] with (c, s) the doubled-angle unit direction along the
+ * contours (read with `directionAt`), weight 0-1, and the blurred lightness gradient per cell.
+ * Only + - * / sqrt, so deterministic.
+ */
+export function shadingField(lab: Grid, sigma: number, minGrad: number): Grid {
+  const { w, h } = lab, n = w * h;
+  const L = makeGrid(w, h, 1);
+  for (let i = 0; i < n; i++) L.data[i] = lab.data[i * 3];
+  // Gradient tensor (central differences) of a single-channel grid.
+  const tensor = (src: Grid) => {
+    const T = makeGrid(w, h, 3), d = src.data;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const gx = ((x + 1 < w ? d[i + 1] : d[i]) - (x > 0 ? d[i - 1] : d[i])) * 0.5;
+      const gy = ((y + 1 < h ? d[i + w] : d[i]) - (y > 0 ? d[i - w] : d[i])) * 0.5;
+      T.data[i * 3] = gx * gx; T.data[i * 3 + 1] = gx * gy; T.data[i * 3 + 2] = gy * gy;
+    }
+    return T;
+  };
+  const S = gaussBlur(tensor(gaussBlur(L, sigma)), sigma), Fn = gaussBlur(tensor(gaussBlur(L, 0.8)), sigma);
+  const out = makeGrid(w, h, 4);
+  for (let i = 0; i < n; i++) {
+    const E = S.data[i * 3], F = S.data[i * 3 + 1], G = S.data[i * 3 + 2], tr = E + G;
+    const fine = Fn.data[i * 3] + Fn.data[i * 3 + 2];
+    if (tr < 1e-14) { out.data[i * 4] = 1; continue; }
+    const coherence = Math.sqrt((E - G) * (E - G) + 4 * F * F) / tr;
+    const smooth = fine > 1e-14 ? tr / fine : 0, grad = Math.sqrt(tr);
+    // Tangent perpendicular to the gradient: doubled angle of the gradient plus 180 degrees.
+    let c = (G - E) / tr, s = -2 * F / tr;
+    const m = Math.sqrt(c * c + s * s);
+    if (m > 1e-12) { c /= m; s /= m; } else { c = 1; s = 0; }
+    out.data[i * 4] = c; out.data[i * 4 + 1] = s;
+    out.data[i * 4 + 2] = smoothstepI((coherence - 0.3) / 0.5) * smoothstepI((smooth - 0.02) / 0.08) * smoothstepI((grad - minGrad) / minGrad);
+    out.data[i * 4 + 3] = grad;
+  }
+  return out;
+}
+const smoothstepI = (x: number) => { const u = x < 0 ? 0 : x > 1 ? 1 : x; return u * u * (3 - 2 * u); };
+
 /** Bilinear sample of channel k at grid coordinates (x, y), clamped at the borders. */
 export function sample(g: Grid, x: number, y: number, k: number): number {
   const { w, h, ch } = g;

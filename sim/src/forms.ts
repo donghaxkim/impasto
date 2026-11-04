@@ -348,13 +348,54 @@ export function regionsAtScale(level: FormLevel, w: number, h: number, tolerance
   for (let i = 0; i < n; i++) label[i] = find(level.label[i]);
   // 3. Opening: parts of a shape narrower than `openRadius` (a lake seen between branches, a
   //    branch against the lake) bind no stroke; only each shape's core does.
-  const inset0 = chamfer(w, h, label), core = new Float64Array(n).fill(1e9), r3 = openRadius * 3;
+  openCores(label, w, h, openRadius);
+  return { label, ...nearestTwo(w, h, label) };
+}
+
+/** Free (label -1) the parts of each shape narrower than `openRadius`, in place. */
+function openCores(label: Int32Array, w: number, h: number, openRadius: number): void {
+  if (openRadius <= 0) return;
+  const n = w * h, inset0 = chamfer(w, h, label), core = new Float64Array(n).fill(1e9), r3 = openRadius * 3;
   for (let i = 0; i < n; i++) if (inset0[i] >= openRadius) core[i] = 0;
   for (let pass = 0; pass < 2; pass++) {
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) relax(core, label, w, h, x, y, 1);
     for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) relax(core, label, w, h, x, y, -1);
   }
   for (let i = 0; i < n; i++) if (core[i] > r3) label[i] = -1;
+}
+
+/**
+ * Shapes split into value bands: each shape's cells are grouped by `band` (an integer per cell, such
+ * as quantised form-scale lightness; cells with the same band in one shape stay together), so a
+ * smooth form turning in the light becomes a few facets, one per band, that presses can land on.
+ * A band holding fewer than `minArea` cells of its shape joins the larger of its neighbouring bands
+ * in that shape. Free cells stay free. Labels are renumbered in scan order, so the result is
+ * deterministic.
+ */
+export function splitRegions(r: Regions, w: number, h: number, band: Int32Array, minArea: number, openRadius = 0): Regions {
+  const n = w * h, OFF = 1 << 12;
+  const keyOf = (lb: number, b: number) => lb * (2 * OFF) + (b + OFF);
+  const area = new Map<number, number>();
+  for (let i = 0; i < n; i++) if (r.label[i] >= 0) { const k = keyOf(r.label[i], band[i]); area.set(k, (area.get(k) ?? 0) + 1); }
+  // Small bands join a neighbouring band of the same shape (the larger of the two either side, out to three bands away).
+  const target = (lb: number, b: number) => {
+    if ((area.get(keyOf(lb, b)) ?? 0) >= minArea) return b;
+    for (let d = 1; d <= 3; d++) {
+      const lo = area.get(keyOf(lb, b - d)) ?? 0, hi = area.get(keyOf(lb, b + d)) ?? 0;
+      if (lo >= minArea || hi >= minArea) return hi > lo ? b + d : b - d;
+    }
+    return b;
+  };
+  const label = new Int32Array(n), ids = new Map<number, number>();
+  for (let i = 0; i < n; i++) {
+    const lb = r.label[i];
+    if (lb < 0) { label[i] = -1; continue; }
+    const k = keyOf(lb, target(lb, band[i]));
+    let id = ids.get(k);
+    if (id === undefined) { id = ids.size; ids.set(k, id); }
+    label[i] = id;
+  }
+  openCores(label, w, h, openRadius);
   return { label, ...nearestTwo(w, h, label) };
 }
 
