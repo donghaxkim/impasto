@@ -21,13 +21,20 @@ export interface PipelineOptions {
   feedback?: boolean;
 }
 
+/**
+ * After a layer: `painting` is the live simulation (null when not simulating) and `plan` the plan so
+ * far (its `tools` are complete from the start). Both are the pipeline's own state: read them (as
+ * the library's layer snapshots do) but never modify them, or later layers change.
+ */
+interface LayerStep { layer: number; layers: number; name: string; strokes: PlannedStroke[]; planMs: number; simMs: number; painting: Readonly<Painting> | null; plan: Readonly<Plan> }
+
 export type PipelineEvent =
   /** The image is analysed (maps, forms) and the layers are known. */
   | { stage: 'analysed'; layers: number; names: string[]; ms: number }
   /** Layer `layer` of `layers` is planned and, when simulating, painted. */
-  | { stage: 'layer'; layer: number; layers: number; name: string; strokes: PlannedStroke[]; planMs: number; simMs: number }
+  | ({ stage: 'layer' } & LayerStep)
   /** Held-back strokes (PlanSettings.deferThin) were planned and painted last, with the last layer. */
-  | { stage: 'deferred'; layer: number; layers: number; name: string; strokes: PlannedStroke[]; planMs: number; simMs: number };
+  | ({ stage: 'deferred' } & LayerStep);
 
 export interface PipelineResult {
   plan: Plan;
@@ -68,7 +75,7 @@ export function* paintPipeline(img: RgbImage, settings: Partial<PlanSettings> = 
     const lp = now() - t;
     planMs += lp;
     const ls = paint(strokes);
-    yield { stage: 'layer', layer: l, layers, name: planner.plan.layerNames[l], strokes, planMs: lp, simMs: ls };
+    yield { stage: 'layer', layer: l, layers, name: planner.plan.layerNames[l], strokes, planMs: lp, simMs: ls, painting, plan: planner.plan };
   }
   // Thin high-contrast marks held back by deferThin go on last, over settled paint (as in planPainting).
   t = now();
@@ -77,7 +84,7 @@ export function* paintPipeline(img: RgbImage, settings: Partial<PlanSettings> = 
   planMs += lp;
   if (last.length) {
     const ls = paint(last);
-    yield { stage: 'deferred', layer: layers - 1, layers, name: planner.plan.layerNames[layers - 1], strokes: last, planMs: lp, simMs: ls };
+    yield { stage: 'deferred', layer: layers - 1, layers, name: planner.plan.layerNames[layers - 1], strokes: last, planMs: lp, simMs: ls, painting, plan: planner.plan };
   }
   return { plan: planner.plan, painting, settings: s, analyseMs, planMs, simMs };
 }

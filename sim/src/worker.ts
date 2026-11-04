@@ -10,18 +10,26 @@
  *   const result = await renderInWorker(worker, file, { preset: 'oil', onProgress, signal });
  *
  * Result buffers are transferred back, not copied. `serveImpasto` also works on any MessagePort.
+ *
+ * Protocol (all messages carry the request's `id`): the page sends 'render' / 'plan' and maybe
+ * 'abort'; the worker answers with any number of 'progress' (and, for a render sent with
+ * `layers: true`, 'layer') messages in order, then one 'result' or 'error'. 'layer' and
+ * `layers` were added later: an older worker ignores `layers` and an older page ignores 'layer'.
  */
-import { planImpasto, renderImpasto, type ImpastoImageSource, type ImpastoOptions, type ImpastoPlanResult, type ImpastoResult, type ProgressInfo } from './index.ts';
+import { planImpasto, renderImpasto, type ImpastoImageSource, type ImpastoOptions, type ImpastoPlanResult, type ImpastoResult, type LayerSnapshot, type ProgressInfo } from './index.ts';
 
 /** Options that can cross to a worker (functions and signals cannot; renderInWorker forwards them). */
-export type WorkerImpastoOptions = Omit<ImpastoOptions, 'signal' | 'onProgress'>;
+export type WorkerImpastoOptions = Omit<ImpastoOptions, 'signal' | 'onProgress' | 'onLayer'>;
 
 export type WorkerRequest =
-  | { type: 'render' | 'plan'; id: number; image: ImpastoImageSource; options?: WorkerImpastoOptions }
+  /** `layers`: post a 'layer' snapshot after each painted layer (render only; sizes from options.snapshot). */
+  | { type: 'render' | 'plan'; id: number; image: ImpastoImageSource; options?: WorkerImpastoOptions; layers?: boolean }
   | { type: 'abort'; id: number };
 
 export type WorkerResponse =
   | { type: 'progress'; id: number; info: ProgressInfo }
+  /** The snapshot's surface.height and surface.color buffers are transferred. */
+  | { type: 'layer'; id: number; snapshot: LayerSnapshot }
   | { type: 'result'; id: number; result: ImpastoResult | ImpastoPlanResult }
   | { type: 'error'; id: number; error: { name: string; message: string; code?: string } };
 
@@ -45,6 +53,10 @@ export function serveImpasto(port: MessagePortLike): void {
     const ac = new AbortController();
     running.set(req.id, ac);
     const options: ImpastoOptions = { ...req.options, signal: ac.signal, onProgress: (info) => port.postMessage({ type: 'progress', id: req.id, info } satisfies WorkerResponse, []) };
+    // Each snapshot has fresh buffers, so they can be handed over rather than copied.
+    if (req.type === 'render' && req.layers === true) {
+      options.onLayer = (snapshot) => port.postMessage({ type: 'layer', id: req.id, snapshot } satisfies WorkerResponse, [snapshot.surface.height.buffer, snapshot.surface.color.buffer]);
+    }
     const job: Promise<ImpastoResult | ImpastoPlanResult> = req.type === 'render' ? renderImpasto(req.image, options) : planImpasto(req.image, options);
     job.then((result) => {
       const transfer = 'image' in result ? [result.image.data.buffer, result.surface.height.buffer, result.surface.color.buffer] as ArrayBuffer[] : [];
