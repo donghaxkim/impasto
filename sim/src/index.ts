@@ -15,6 +15,7 @@ import { surfaceFromCanvas, type ImpastoSurface } from './surface.ts';
 import type { RgbImage } from './image.ts';
 import { paintPipeline, type PipelineEvent, type PipelineResult } from './pipeline.ts';
 import { PRESET_NAMES, resolvePreset, type PresetName } from './presets.ts';
+import { DEFAULT_SNAPSHOT_MAX_SIDE, snapshotFactor, strokesToJSON, surfaceSnapshot, type ImpastoStroke } from './snapshot.ts';
 
 export type { ImpastoSurface } from './surface.ts';
 export type { LightSettings, LookName } from './relight.ts';
@@ -23,6 +24,7 @@ export { DEFAULT_LIGHT } from './relight.ts';
 export { DEFAULT_SETTINGS } from './planner.ts';
 export { PRESETS, PRESET_NAMES, resolvePreset, type PresetName, type Preset } from './presets.ts';
 export { surfaceFromCanvas, encodeSurface, decodeSurface, SURFACE_VERSION } from './surface.ts';
+export { DEFAULT_SNAPSHOT_MAX_SIDE, downsampleSurface, snapshotFactor, strokesToJSON, type ImpastoStroke, type Rgb01 } from './snapshot.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Errors
@@ -101,6 +103,50 @@ export interface ProgressInfo {
   fraction: number;
 }
 
+/**
+ * The canvas after one layer, for showing the painting come together (renderImpasto's onLayer).
+ * Plain data: structured-cloneable, and everything except `surface` is JSON-serialisable.
+ */
+export interface LayerSnapshot {
+  /** Layer index, 0-based, and the number of layers. */
+  layer: number;
+  layers: number;
+  /** Layer name: underpaint, block-in, masses, presses, forms, detail, contours, accents. */
+  name: string;
+  /**
+   * True for the one extra snapshot after the thin lights held back by PlanSettings.deferThin (off
+   * by default), painted last with the last layer: then `layer` is layers - 1 a second time.
+   */
+  deferred: boolean;
+  /** Progress at the end of this layer, 0-1 (the same scale as onProgress). */
+  fraction: number;
+  /** This layer's strokes in paint order. */
+  strokes: ImpastoStroke[];
+  /**
+   * The canvas after this layer, box-downsampled so its longest side is at most snapshot.maxSide
+   * cells (`dx` is the snapshot's cell size in mm; `scale` full-size cells per snapshot cell).
+   * At full size (scale 1) it is exactly what surfaceFromCanvas gives, as the result's surface.
+   * Fresh buffers for every snapshot: keep them, upload them or transfer them.
+   */
+  surface: ImpastoSurface;
+  scale: number;
+  /** Canvas size, mm. The snapshot covers surface.w x surface.dx mm, which can exceed widthMm by less than one snapshot cell. */
+  widthMm: number;
+  heightMm: number;
+  /** Milliseconds spent planning and simulating this layer. */
+  planMs: number;
+  paintMs: number;
+}
+
+export interface SnapshotOptions {
+  /**
+   * Longest side of the snapshot surface, in cells (default DEFAULT_SNAPSHOT_MAX_SIDE, 600).
+   * The canvas is shrunk by the smallest whole factor that fits. Infinity gives full resolution
+   * (0.1 mm cells: 2400 x 1150 for a 240 mm landscape, 24 bytes a cell).
+   */
+  maxSide?: number;
+}
+
 export interface ImpastoOptions {
   /** 'oil' (default) the intended look; 'locked' the round-3 reference; 'smooth' calmer and more blended. */
   preset?: PresetName;
@@ -116,6 +162,16 @@ export interface ImpastoOptions {
   /** Light for the returned image, over the preset's light (azimuth, elevation, relief, exposure, glow, look). */
   light?: Partial<LightSettings>;
   onProgress?: (info: ProgressInfo) => void;
+  /**
+   * renderImpasto only: called after each layer is painted, in order, with the canvas so far and
+   * the layer's strokes (see LayerSnapshot). Snapshots are only computed when this is set, and they
+   * never change the painting. If it throws, the error is reported (globalThis.reportError where
+   * there is one, as for an uncaught error in an event listener, else console.error) and the render
+   * carries on. Through renderInWorker it is called on the page with the worker's snapshots.
+   */
+  onLayer?: (snapshot: LayerSnapshot) => void;
+  /** Size of the onLayer snapshots. */
+  snapshot?: SnapshotOptions;
   /** Checked between stages and layers; aborting rejects with signal.reason (an AbortError DOMException by default). */
   signal?: AbortSignal;
   /**
@@ -148,8 +204,12 @@ export interface ImpastoResult {
   light: LightSettings;
   /** Number of knife and brush strokes painted. */
   strokes: number;
-  /** Milliseconds: analyse, plan, paint (simulation), relight, surface, total. */
-  timings: Record<'analyse' | 'plan' | 'paint' | 'relight' | 'surface' | 'total', number>;
+  /** Every stroke in paint order as plain data (JSON.stringify gives a downloadable stroke list). */
+  strokeList: ImpastoStroke[];
+  /** Layer names, indexed by ImpastoStroke.layer. */
+  layerNames: string[];
+  /** Milliseconds: analyse, plan, paint (simulation), snapshot (onLayer snapshots; 0 without), relight, surface, total. */
+  timings: Record<'analyse' | 'plan' | 'paint' | 'snapshot' | 'relight' | 'surface' | 'total', number>;
 }
 
 export interface ImpastoPlanResult {
@@ -293,6 +353,11 @@ function resolveOptions(img: RgbImage, o: ImpastoOptions): Resolved {
     if (k === 'look' ? v !== 'locked' && v !== 'oil' : typeof v !== 'number' || !Number.isFinite(v)) throw new ImpastoError('BAD_OPTION', `light.${k} is invalid: ${String(v)}`);
   }
   if (o.onProgress !== undefined && typeof o.onProgress !== 'function') throw new ImpastoError('BAD_OPTION', 'onProgress must be a function');
+  if (o.onLayer !== undefined && typeof o.onLayer !== 'function') throw new ImpastoError('BAD_OPTION', 'onLayer must be a function');
+  if (o.snapshot !== undefined) {
+    const m = o.snapshot === null || typeof o.snapshot !== 'object' ? NaN : o.snapshot.maxSide ?? DEFAULT_SNAPSHOT_MAX_SIDE;
+    if (typeof m !== 'number' || !(m >= 1)) throw new ImpastoError('BAD_OPTION', `snapshot must be { maxSide?: number >= 1 or Infinity }, got ${JSON.stringify(o.snapshot)}`);
+  }
   const r = resolvePreset(preset, adv, light);
   const seed = adv.seed ?? o.seed ?? r.settings.seed;
   if (typeof seed !== 'number' || !Number.isSafeInteger(seed)) throw new ImpastoError('BAD_OPTION', `seed must be an integer, got ${String(seed)}`);
@@ -317,19 +382,46 @@ function abortError(signal: AbortSignal): unknown {
 }
 function checkAbort(signal?: AbortSignal): void { if (signal?.aborted) throw abortError(signal); }
 
+/** Reports an error thrown by a user callback without stopping the render (as an event listener's would be). */
+function reportCallbackError(err: unknown): void {
+  const re = (globalThis as G).reportError;
+  if (typeof re === 'function') { try { (re as (e: unknown) => void)(err); return; } catch { /* fall through */ } }
+  console.error('impasto-sim: the onLayer callback threw; the render carries on.', err);
+}
+
+/** Calls onLayer, which must not break the render (see ImpastoOptions.onLayer). */
+function callOnLayer(onLayer: (s: LayerSnapshot) => void, snap: LayerSnapshot): void {
+  try { onLayer(snap); } catch (err) { reportCallbackError(err); }
+}
+
 /** Runs the pipeline step by step, yielding to the event loop and checking `signal` between steps. */
-async function drive(img: RgbImage, r: Resolved, o: ImpastoOptions, simulate: boolean, paintShare: number): Promise<PipelineResult> {
+async function drive(img: RgbImage, r: Resolved, o: ImpastoOptions, simulate: boolean, paintShare: number): Promise<PipelineResult & { snapshotMs: number }> {
   const report = (info: ProgressInfo): void => o.onProgress?.(info);
   const it = paintPipeline(img, r.settings, { simulate });
   const A = 0.05; // analysis share of the fraction
+  const onLayer = simulate ? o.onLayer : undefined, maxSide = o.snapshot?.maxSide ?? DEFAULT_SNAPSHOT_MAX_SIDE;
+  let snapshotMs = 0;
   report({ stage: 'analyse', fraction: 0 });
   await tick(); checkAbort(o.signal);
   let layers = 0, names: string[] = [];
   for (;;) {
     const step = it.next();
-    if (step.done) return step.value;
+    if (step.done) return { ...step.value, snapshotMs };
     const e: PipelineEvent = step.value;
     if (e.stage === 'analysed') { layers = e.layers; names = e.names; }
+    else if (onLayer && e.painting) {
+      // Read-only: the snapshot copies out of the canvas and plan, so the painting is unchanged.
+      const t = now(), c = e.painting.canvas;
+      const surface = surfaceSnapshot(c, maxSide), scale = snapshotFactor(c.w, c.h, maxSide);
+      const snap: LayerSnapshot = {
+        layer: e.layer, layers: e.layers, name: e.name, deferred: e.stage === 'deferred',
+        fraction: A + (paintShare - A) * (e.layer + 1) / e.layers,
+        strokes: strokesToJSON(e.plan, e.strokes), surface, scale,
+        widthMm: e.plan.widthMm, heightMm: e.plan.heightMm, planMs: Math.round(e.planMs), paintMs: Math.round(e.simMs),
+      };
+      snapshotMs += now() - t;
+      callOnLayer(onLayer, snap);
+    }
     const next = e.stage === 'analysed' ? 0 : e.layer + 1;
     if (e.stage !== 'deferred' && next < layers) {
       report({ stage: 'paint', layer: next, layers, layerName: names[next], fraction: A + (paintShare - A) * next / layers });
@@ -362,13 +454,15 @@ export async function renderImpasto(image: ImpastoImageSource, options: ImpastoO
   t = now();
   const surface = surfaceFromCanvas(painting.canvas);
   const surfaceMs = now() - t;
+  const strokeList = strokesToJSON(res.plan);
   checkAbort(options.signal);
   options.onProgress?.({ stage: 'done', fraction: 1 });
   const ms = (v: number) => Math.round(v);
   return {
     image: { width: w, height: h, data: rgba }, surface,
     widthMm: r.widthMm, heightMm: res.plan.heightMm, preset: r.preset, seed: r.seed, light: r.light, strokes: res.plan.strokes.length,
-    timings: { analyse: ms(res.analyseMs), plan: ms(res.planMs), paint: ms(res.simMs), relight: ms(relightMs), surface: ms(surfaceMs), total: ms(now() - t0) },
+    strokeList, layerNames: [...res.plan.layerNames],
+    timings: { analyse: ms(res.analyseMs), plan: ms(res.planMs), paint: ms(res.simMs), snapshot: ms(res.snapshotMs), relight: ms(relightMs), surface: ms(surfaceMs), total: ms(now() - t0) },
   };
 }
 
@@ -404,7 +498,9 @@ export interface ImpastoWorkerLike {
 let nextId = 1;
 
 function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image: ImpastoImageSource, options: ImpastoOptions): Promise<T> {
-  const { signal, onProgress, ...rest } = options ?? {};
+  const { signal, onProgress, onLayer, ...rest } = options ?? {};
+  // Functions cannot cross to the worker: check here what renderImpasto would check there.
+  if (onLayer !== undefined && typeof onLayer !== 'function') return Promise.reject(new ImpastoError('BAD_OPTION', 'onLayer must be a function'));
   return new Promise<T>((resolve, reject) => {
     if (signal?.aborted) { reject(abortError(signal)); return; }
     const id = nextId++;
@@ -423,9 +519,10 @@ function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image
       fail(new ImpastoError('WORKER_FAILED', `the impasto worker failed${e?.message ? `: ${e.message}` : e?.type === 'messageerror' ? ': a message could not be deserialised' : ''}`));
     };
     const onMessage = (e: { data: unknown }): void => {
-      const m = e.data as { type: string; id: number; info?: ProgressInfo; result?: T; error?: { name: string; message: string; code?: string } };
+      const m = e.data as { type: string; id: number; info?: ProgressInfo; snapshot?: LayerSnapshot; result?: T; error?: { name: string; message: string; code?: string } };
       if (!m || m.id !== id) return;
       if (m.type === 'progress') onProgress?.(m.info!);
+      else if (m.type === 'layer') { if (onLayer && m.snapshot) callOnLayer(onLayer, m.snapshot); }
       else if (m.type === 'result') { done(); resolve(m.result!); }
       else if (m.type === 'error') {
         done();
@@ -445,7 +542,8 @@ function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image
       (img) => {
         if (settled || signal?.aborted) return;
         // postMessage throws synchronously for what it cannot clone (a Proxy, e.g. a Vue reactive object, or a function).
-        try { worker.postMessage({ type, id, image: img, options: rest }); }
+        // `layers` asks the worker for onLayer snapshots (a worker from before them ignores it, and no snapshots arrive).
+        try { worker.postMessage(type === 'render' && onLayer ? { type, id, image: img, options: rest, layers: true } : { type, id, image: img, options: rest }); }
         catch (e) { fail(new ImpastoError('BAD_OPTION', `could not send the job to the worker: ${(e as Error).message} (pass plain data, not reactive proxies or functions)`)); }
       },
       fail,
@@ -453,7 +551,10 @@ function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image
   });
 }
 
-/** renderImpasto in a worker: same options and result; progress and abort are forwarded. */
+/**
+ * renderImpasto in a worker: same options and result; progress, abort and onLayer snapshots are
+ * forwarded (snapshot and result buffers are transferred, not copied).
+ */
 export function renderInWorker(worker: ImpastoWorkerLike, image: ImpastoImageSource, options: ImpastoOptions = {}): Promise<ImpastoResult> {
   return callWorker<ImpastoResult>(worker, 'render', image, options);
 }

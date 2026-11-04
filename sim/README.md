@@ -49,7 +49,49 @@ attachPointerLight(viewer);
 
 `impasto-sim/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `impasto-sim`) save and load a result's `surface` as an `.impasto` file. The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
 
-- **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes`, and `timings` in ms.
+- **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes` (the count), `strokeList` (every stroke as plain data, below), `layerNames`, and `timings` in ms (`analyse`, `plan`, `paint`, `snapshot`, `relight`, `surface`, `total`).
+- **Stroke list:** `result.strokeList` is `ImpastoStroke[]` in paint order, plain JSON (`JSON.stringify(result.strokeList)` is a downloadable stroke list). `strokesToJSON(plan)` converts a `planImpasto` plan the same way. Each stroke, in mm from the canvas's top-left corner (x right, y down), points rounded to 0.001 mm and colours and samples to 1e-4:
+
+  ```ts
+  interface ImpastoStroke {
+    index: number; layer: number;            // paint order; layerNames[layer]
+    tool: 'knife' | 'bristle';
+    primitive: 'underpaint' | 'sweep' | 'plane' | 'mark' | 'scumble' | 'pat' | 'contour' | 'accent' | 'press';
+    points: [number, number][];              // the blade centre's path; the last stretch is the lift-off tail
+    widthMm: number; lengthMm: number;       // blade width, path length
+    contact: number[];                       // 11 samples start to end: mark width there ≈ widthMm × contact
+    pressure: number[];                      // hand pressure samples start to end
+    color: [r, g, b]; secondary: [r, g, b]; secondaryFraction: number;   // sRGB 0-1
+    colors?: [r, g, b][]; mix?: number;      // streaked loads: colours across the blade, 0 streaky - 1 blended
+    thicknessMm: number; heap: number;       // paint left under the blade; terminal heap (0-1.5)
+  }
+  ```
+- **Layer snapshots** (`onLayer`, for showing the painting come together): after each layer is painted, `onLayer(snapshot)` gets the canvas so far and that layer's strokes. Snapshots are computed only when `onLayer` is set, never change the painting (a test checks the image, surface and strokes are identical with and without it), and `planImpasto` takes none (it paints nothing).
+
+  ```ts
+  const result = await renderImpasto(file, {
+    snapshot: { maxSide: 600 },     // default: longest side at most 600 cells; Infinity for full resolution (0.1 mm)
+    onLayer: (s) => {               // s: LayerSnapshot
+      showSurface(s.surface);                   // your page: relight it, e.g. with createImpastoViewer
+      animateStrokes(s.strokes, s.surface.dx);  // your page: s.strokes in paint order; mm / dx = snapshot cells
+      label.textContent = `${s.layer + 1}/${s.layers} ${s.name}`;
+    },
+  });
+  ```
+
+  ```ts
+  interface LayerSnapshot {
+    layer: number; layers: number; name: string;  // underpaint, block-in, masses, presses, forms, detail, contours, accents
+    deferred: boolean;    // true only for one extra snapshot after PlanSettings.deferThin's held-back lights (off by default)
+    fraction: number;     // progress at the end of this layer (onProgress's scale)
+    strokes: ImpastoStroke[];
+    surface: ImpastoSurface;  // the canvas after this layer, at most maxSide cells a side; fresh buffers each time
+    scale: number;            // full-size cells per snapshot cell (1 at full size)
+    widthMm: number; heightMm: number; planMs: number; paintMs: number;
+  }
+  ```
+
+  The surface is shrunk by the smallest whole factor that fits `maxSide`: colour (linear albedo, roughness) and both height channels are box-averaged over each block (partial blocks on the right and bottom edges), `dx` grows by the factor so slopes and shadows keep their scale, and `maxH` is recomputed. At full size it is exactly `surfaceFromCanvas`, so the last snapshot equals `result.surface` (without `deferThin`). `downsampleSurface(surface, maxSide)` does the same to any surface, for example the final one to match the snapshots. Cost: the full canvas's height, shadow and colour fields once per layer, measured at 2.5-4% of the render on a 30 mm test canvas and about 3% at 120 mm (150 ms a snapshot at 1.1 M cells, mostly the full-size shadow-height filter), and about 0.4 s a snapshot at 4.3 M cells (240 x 180 mm), against several seconds to a minute of painting per layer. If `onLayer` throws, the error goes to `globalThis.reportError` (a browser's uncaught-error reporting; `console.error` where there is none) and the render carries on.
 - **Presets** (`src/presets.ts`), each a few overrides on `DEFAULT_SETTINGS` and `DEFAULT_LIGHT`, so planner defaults flow through:
   - `'oil'` (default): the planner's `oil` look with all its defaults, semi-gloss renderer.
   - `'locked'`: the round-3 reference look, identical to `npm run paint -- --look locked` (a test pins it).
@@ -67,7 +109,17 @@ attachPointerLight(viewer);
   const result = await renderInWorker(worker, file, { preset: 'oil', onProgress, signal });
   ```
 
-  Same options and result; progress and abort are forwarded and the result buffers are transferred. `<img>` and canvas sources are read on the page first; Blobs and ImageBitmaps are decoded in the worker.
+  Same options and result; progress, abort and `onLayer` are forwarded, and the result and snapshot buffers are transferred. `<img>` and canvas sources are read on the page first; Blobs and ImageBitmaps are decoded in the worker.
+
+  ```ts
+  const result = await renderInWorker(worker, file, {
+    preset: 'oil', signal, onProgress,
+    snapshot: { maxSide: 600 },
+    onLayer: (s) => showLayer(s),   // runs on the page; s.surface's Float32Arrays were transferred, not copied
+  });
+  ```
+
+  With `onLayer` set, the page's request carries `layers: true` and the worker posts a `{ type: 'layer', id, snapshot }` message after each layer, before the next `progress`, transferring `snapshot.surface.height` and `.color`. The protocol stays compatible both ways: an older worker ignores `layers` (no snapshots arrive, the render still works), and an older page ignores `layer` messages. A throwing `onLayer` on the page is reported as above and the render carries on; aborting (even from inside `onLayer`) works as before.
 
 ### Using it from the website
 
@@ -99,6 +151,7 @@ Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan →
 - `src/relight.ts`: the reference renderer, with GGX clearcoat, ray-marched shadows and horizon occlusion.
 - `src/relight-gpu.ts`: WebGPU port of the renderer.
 - `src/surface.ts`: `ImpastoSurface`, the packed height and colour buffers a renderer needs, and the `.impasto` file format.
+- `src/snapshot.ts`: per-layer snapshots for the library's `onLayer` (box-downsampled surfaces) and strokes as plain JSON (`ImpastoStroke`).
 - `src/viewer.ts`: the browser viewer (live WebGPU relighting with a static fallback); `src/viewer-bundle.ts` inlines it into pages.
 - `src/dmath.ts`: math that gives the same result on any JS engine. Paint code must not call `Math.sin`, `Math.pow`, `Math.exp` or `Math.random`.
 - `src/pigment.ts`: colour conversion. Node and cell RGB are stored as Kubelka-Munk K/S, so mixing behaves more like pigment.
