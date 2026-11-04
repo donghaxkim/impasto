@@ -21,6 +21,11 @@
       "source": "./src/worker.ts",
       "default": "./dist/worker.js"
     },
+    "./viewer": {
+      "types": "./dist/viewer.d.ts",
+      "source": "./src/viewer.ts",
+      "default": "./dist/viewer.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -51,6 +56,7 @@
     "test:api": "node --experimental-strip-types --no-warnings --test tests/api.test.ts"
   },
   "devDependencies": {
+    "@webgpu/types": "^0.1.74",
     "typescript": "^5.9.3"
   }
 }

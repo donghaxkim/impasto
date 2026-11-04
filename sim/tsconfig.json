@@ -7,7 +7,7 @@
     "moduleResolution": "NodeNext",
     // DOM for performance, setTimeout, AbortSignal, DOMException; Node has the same globals.
     "lib": ["ES2022", "DOM"],
-    "types": [],
+    "types": ["@webgpu/types"],
     "strict": true,
     "skipLibCheck": true,
     "isolatedModules": true,
@@ -17,5 +17,5 @@
     "rewriteRelativeImportExtensions": true,
     "noEmit": true
   },
-  "files": ["src/index.ts", "src/worker.ts"]
+  "files": ["src/index.ts", "src/worker.ts", "src/viewer.ts"]
 }

@@ -40,8 +40,14 @@ const result = await renderImpasto(file, {        // ImageData, { width, height,
   signal: controller.signal,                      // checked between layers; rejects with an AbortError
 });
 ctx.putImageData(new ImageData(result.image.data, result.image.width), 0, 0); // RGBA, lit on the CPU
-viewer.load(result.surface);                      // ImpastoSurface: height and colour buffers for live relighting
+
+// Live light: WebGPU where available, otherwise the CPU image above (see "Live viewer").
+import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';
+const viewer = await createImpastoViewer(canvasEl, result.surface, { look: 'oil', fallback: result.image });
+attachPointerLight(viewer);
 ```
+
+`impasto-sim/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `impasto-sim`) save and load a result's `surface` as an `.impasto` file. The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
 
 - **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes`, and `timings` in ms.
 - **Presets** (`src/presets.ts`), each a few overrides on `DEFAULT_SETTINGS` and `DEFAULT_LIGHT`, so planner defaults flow through:
@@ -102,7 +108,7 @@ Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan →
 `src/viewer.ts` is a browser-only module, no dependencies, that relights a painted surface live. Nothing in the paint path imports it, so the simulation runs the same with no GPU.
 
 ```ts
-import { createImpastoViewer, attachPointerLight } from './viewer.ts';
+import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';   // or './viewer.ts' inside this repo
 const viewer = await createImpastoViewer(canvasEl, surface /* ImpastoSurface */, {
   light: { azimuth: 225, elevation: 30 },   // Partial<LightSettings>; defaults to DEFAULT_LIGHT
   look: 'oil', view: 'paint',

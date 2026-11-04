@@ -22,7 +22,7 @@ export type { Plan, PlanSettings, PlannedStroke, LayerSpec } from './planner.ts'
 export { DEFAULT_LIGHT } from './relight.ts';
 export { DEFAULT_SETTINGS } from './planner.ts';
 export { PRESETS, PRESET_NAMES, resolvePreset, type PresetName, type Preset } from './presets.ts';
-export { surfaceFromCanvas } from './surface.ts';
+export { surfaceFromCanvas, encodeSurface, decodeSurface, SURFACE_VERSION } from './surface.ts';
 
 // ---------------------------------------------------------------------------------------------
 // Errors
