@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { DEFAULT_SETTINGS, FAMILIES, labToLinear, Planner, planPainting, scaleLayers, type PlannedStroke, type PlanSettings } from '../src/planner.ts';
-import { directionAt, directionField, gaussBlur, makeGrid, sample, shadingField, toOklab, type RgbImage } from '../src/image.ts';
+import { cbrtFast, directionAt, directionField, gaussBlur, makeGrid, sample, shadingField, toOklab, type RgbImage } from '../src/image.ts';
+import { dcbrt, rng } from '../src/dmath.ts';
 import { canvasColour, paintStrokes, startPainting } from '../src/execute.ts';
 import { clearance, regionsAtScale } from '../src/forms.ts';
 import { srgbToLinear } from '../src/pigment.ts';
@@ -32,6 +33,42 @@ const OIL: Partial<PlanSettings> = { ...SMALL, look: 'oil', autoScale: false };
 /** The round-5 options (shading direction, value bands, press restraint) turned off. */
 const NO_PLANES: Partial<PlanSettings> = { shading: 0, valueBands: 0, pressRestraint: 0 };
 const digest = (o: unknown) => createHash('sha256').update(JSON.stringify(o)).digest('hex');
+
+test('image: cbrtFast is dcbrt to the bit, and the row-major boxBlur matches a per-column one', () => {
+  const r = rng(11);
+  const same = (v: number) => assert.ok(Object.is(dcbrt(v), cbrtFast(v)), `cbrt(${v}): ${dcbrt(v)} vs ${cbrtFast(v)}`);
+  for (const v of [0, -2, 5e-324, 1e-300, 1e-12, 0.001, 0.5, 1 - 2 ** -53, 1, 1 + 2 ** -52, 2, 8, 27, 1e6, 1e300, Infinity, NaN]) same(v);
+  for (let i = 0; i < 200000; i++) same(r());
+  for (let i = 0; i < 100000; i++) same(r() * 2 ** (Math.floor(r() * 60) - 30));
+  // Every sRGB grey, as the planner's pixels reach it (linear light), through all three OKLab cones.
+  for (let c = 0; c < 256; c++) { const l = srgbToLinear(c / 255); same((0.4122214708 + 0.5363325363 + 0.0514459929) * l); same((0.2119034982 + 0.6806995451 + 0.1073969566) * l); same((0.0883024619 + 0.2817188376 + 0.6299787005) * l); }
+  // boxBlur against a plain per-column implementation of its second sweep.
+  const g = makeGrid(37, 23, 3);
+  for (let i = 0; i < g.data.length; i++) g.data[i] = r() * 3 - 1;
+  for (const rad of [1, 2, 5]) {
+    const got = gaussBlur(g, 0.3 + rad).data;
+    const { w, h, ch } = g, tmp = new Float64Array(g.data.length), ref = new Float64Array(g.data.length), norm = 1 / (2 * rad + 1);
+    // One box pass, written as the original per-column loop; three passes make the gaussBlur.
+    const box = (src: Float64Array): Float64Array => {
+      for (let y = 0; y < h; y++) for (let k = 0; k < ch; k++) {
+        let sum = 0;
+        for (let x = -rad; x <= rad; x++) sum += src[(y * w + (x < 0 ? 0 : x >= w ? w - 1 : x)) * ch + k];
+        for (let x = 0; x < w; x++) { tmp[(y * w + x) * ch + k] = sum * norm; const add = x + rad + 1, sub = x - rad; sum += src[(y * w + (add >= w ? w - 1 : add)) * ch + k] - src[(y * w + (sub < 0 ? 0 : sub)) * ch + k]; }
+      }
+      const out = new Float64Array(src.length);
+      for (let x = 0; x < w; x++) for (let k = 0; k < ch; k++) {
+        let sum = 0;
+        for (let y = -rad; y <= rad; y++) sum += tmp[((y < 0 ? 0 : y >= h ? h - 1 : y) * w + x) * ch + k];
+        for (let y = 0; y < h; y++) { out[(y * w + x) * ch + k] = sum * norm; const add = y + rad + 1, sub = y - rad; sum += tmp[((add >= h ? h - 1 : add) * w + x) * ch + k] - tmp[((sub < 0 ? 0 : sub) * w + x) * ch + k]; }
+      }
+      return out;
+    };
+    const sigma = 0.3 + rad, rr = Math.max(1, Math.floor((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2 + 0.5));
+    assert.equal(rr, rad);
+    ref.set(box(box(box(g.data))));
+    assert.deepEqual(Array.from(got), Array.from(ref), `box radius ${rad}`);
+  }
+});
 
 test('planner: same image, settings and seed give an identical plan; a new seed differs', () => {
   const img = landscape();

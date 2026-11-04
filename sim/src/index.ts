@@ -10,7 +10,7 @@
  * responsive; use `impasto-sim/worker` (see `renderInWorker`) to keep it off the main thread.
  */
 import { type Plan, type PlanSettings } from './planner.ts';
-import { relight, type LightSettings } from './relight.ts';
+import { canvasFields, relight, type LightSettings } from './relight.ts';
 import { surfaceFromCanvas, type ImpastoSurface } from './surface.ts';
 import type { RgbImage } from './image.ts';
 import { paintPipeline, type PipelineEvent, type PipelineResult } from './pipeline.ts';
@@ -161,6 +161,14 @@ export interface ImpastoOptions {
   seed?: number;
   /** Light for the returned image, over the preset's light (azimuth, elevation, relief, exposure, glow, look). */
   light?: Partial<LightSettings>;
+  /**
+   * renderImpasto only. 'full' (default): light the painting on the CPU and return it as `image`.
+   * 'none': skip that (the slowest step after painting, seconds per megacell) and return
+   * `image: null`; the result's `surface` is unchanged, so a page that relights live
+   * (createImpastoViewer) and only needs the static image as a fallback or download can
+   * relightSurface(result.surface, light) later. Progress still ends at 'done', fraction 1.
+   */
+  image?: 'full' | 'none';
   onProgress?: (info: ProgressInfo) => void;
   /**
    * renderImpasto only: called after each layer is painted, in order, with the canvas so far and
@@ -200,7 +208,7 @@ export interface ImpastoResult {
   heightMm: number;
   preset: PresetName;
   seed: number;
-  /** The light `image` was rendered with (preset light plus options.light). */
+  /** The light `image` was (or, with `image: 'none'`, would be) rendered with: preset light plus options.light. */
   light: LightSettings;
   /** Number of knife and brush strokes painted. */
   strokes: number;
@@ -208,9 +216,15 @@ export interface ImpastoResult {
   strokeList: ImpastoStroke[];
   /** Layer names, indexed by ImpastoStroke.layer. */
   layerNames: string[];
-  /** Milliseconds: analyse, plan, paint (simulation), snapshot (onLayer snapshots; 0 without), relight, surface, total. */
+  /** Milliseconds: analyse, plan, paint (simulation), snapshot (onLayer snapshots; 0 without), relight (0 with `image: 'none'`), surface, total. */
   timings: Record<'analyse' | 'plan' | 'paint' | 'snapshot' | 'relight' | 'surface' | 'total', number>;
 }
+
+/** renderImpasto's result with `image: 'none'`: the same, with `image: null` (and `timings.relight` 0). */
+export type ImpastoResultNoImage = Omit<ImpastoResult, 'image'> & { image: null };
+/** Options that ask for no lit image, and options that do not. */
+export type ImpastoOptionsNoImage = ImpastoOptions & { image: 'none' };
+export type ImpastoOptionsWithImage = ImpastoOptions & { image?: 'full' };
 
 export interface ImpastoPlanResult {
   /** The ordered stroke plan (planned against the planner's own estimate, not a simulated canvas). */
@@ -353,6 +367,7 @@ function resolveOptions(img: RgbImage, o: ImpastoOptions): Resolved {
     if (k === 'look' ? v !== 'locked' && v !== 'oil' : typeof v !== 'number' || !Number.isFinite(v)) throw new ImpastoError('BAD_OPTION', `light.${k} is invalid: ${String(v)}`);
   }
   if (o.onProgress !== undefined && typeof o.onProgress !== 'function') throw new ImpastoError('BAD_OPTION', 'onProgress must be a function');
+  if (o.image !== undefined && o.image !== 'full' && o.image !== 'none') throw new ImpastoError('BAD_OPTION', `image must be 'full' or 'none', got ${JSON.stringify(o.image)}`);
   if (o.onLayer !== undefined && typeof o.onLayer !== 'function') throw new ImpastoError('BAD_OPTION', 'onLayer must be a function');
   if (o.snapshot !== undefined) {
     const m = o.snapshot === null || typeof o.snapshot !== 'object' ? NaN : o.snapshot.maxSide ?? DEFAULT_SNAPSHOT_MAX_SIDE;
@@ -436,30 +451,38 @@ async function drive(img: RgbImage, r: Resolved, o: ImpastoOptions, simulate: bo
  * Throws ImpastoError (with a `code`) for bad input or options, and rejects with the signal's
  * reason when aborted. Deterministic: the same pixels, options and seed give the same result.
  */
-export async function renderImpasto(image: ImpastoImageSource, options: ImpastoOptions = {}): Promise<ImpastoResult> {
+export function renderImpasto(image: ImpastoImageSource, options: ImpastoOptionsNoImage): Promise<ImpastoResultNoImage>;
+export function renderImpasto(image: ImpastoImageSource, options?: ImpastoOptionsWithImage): Promise<ImpastoResult>;
+export function renderImpasto(image: ImpastoImageSource, options?: ImpastoOptions): Promise<ImpastoResult | ImpastoResultNoImage>;
+export async function renderImpasto(image: ImpastoImageSource, options: ImpastoOptions = {}): Promise<ImpastoResult | ImpastoResultNoImage> {
   const t0 = now();
   checkAbort(options?.signal);
   const img = pixelsToRgb(await imageToPixels(image));
   const r = resolveOptions(img, options);
   const res = await drive(img, r, options, true, 0.9);
-  const painting = res.painting!;
-  options.onProgress?.({ stage: 'relight', fraction: 0.9 });
+  const painting = res.painting!, canvas = painting.canvas, { w, h, n } = canvas;
+  const wantImage = options.image !== 'none';
+  if (wantImage) options.onProgress?.({ stage: 'relight', fraction: 0.9 });
   await tick(); checkAbort(options.signal);
+  // The surface packs the same height and albedo fields the relight reads (relief 1): derive them once.
   let t = now();
-  const rgb = relight(painting.canvas, r.light, 'paint');
-  const relightMs = now() - t;
-  const { w, h, n } = painting.canvas;
-  const rgba = new Uint8ClampedArray(n * 4);
-  for (let i = 0; i < n; i++) { rgba[i * 4] = rgb[i * 3]; rgba[i * 4 + 1] = rgb[i * 3 + 1]; rgba[i * 4 + 2] = rgb[i * 3 + 2]; rgba[i * 4 + 3] = 255; }
-  t = now();
-  const surface = surfaceFromCanvas(painting.canvas);
+  const fields = canvasFields(canvas, 1);
+  let lit: ImpastoImage | null = null, relightMs = 0;
+  if (wantImage) {
+    const rgba = new Uint8ClampedArray(n * 4);
+    relight(canvas, r.light, 'paint', r.light.relief === 1 ? fields : undefined, rgba, 4);
+    lit = { width: w, height: h, data: rgba };
+    relightMs = now() - t;
+    t = now();
+  }
+  const surface = surfaceFromCanvas(canvas, fields);
   const surfaceMs = now() - t;
   const strokeList = strokesToJSON(res.plan);
   checkAbort(options.signal);
   options.onProgress?.({ stage: 'done', fraction: 1 });
   const ms = (v: number) => Math.round(v);
   return {
-    image: { width: w, height: h, data: rgba }, surface,
+    image: lit as ImpastoImage, surface,
     widthMm: r.widthMm, heightMm: res.plan.heightMm, preset: r.preset, seed: r.seed, light: r.light, strokes: res.plan.strokes.length,
     strokeList, layerNames: [...res.plan.layerNames],
     timings: { analyse: ms(res.analyseMs), plan: ms(res.planMs), paint: ms(res.simMs), snapshot: ms(res.snapshotMs), relight: ms(relightMs), surface: ms(surfaceMs), total: ms(now() - t0) },
@@ -555,8 +578,11 @@ function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image
  * renderImpasto in a worker: same options and result; progress, abort and onLayer snapshots are
  * forwarded (snapshot and result buffers are transferred, not copied).
  */
-export function renderInWorker(worker: ImpastoWorkerLike, image: ImpastoImageSource, options: ImpastoOptions = {}): Promise<ImpastoResult> {
-  return callWorker<ImpastoResult>(worker, 'render', image, options);
+export function renderInWorker(worker: ImpastoWorkerLike, image: ImpastoImageSource, options: ImpastoOptionsNoImage): Promise<ImpastoResultNoImage>;
+export function renderInWorker(worker: ImpastoWorkerLike, image: ImpastoImageSource, options?: ImpastoOptionsWithImage): Promise<ImpastoResult>;
+export function renderInWorker(worker: ImpastoWorkerLike, image: ImpastoImageSource, options?: ImpastoOptions): Promise<ImpastoResult | ImpastoResultNoImage>;
+export function renderInWorker(worker: ImpastoWorkerLike, image: ImpastoImageSource, options: ImpastoOptions = {}): Promise<ImpastoResult | ImpastoResultNoImage> {
+  return callWorker<ImpastoResult | ImpastoResultNoImage>(worker, 'render', image, options);
 }
 
 /** planImpasto in a worker. */

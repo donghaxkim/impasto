@@ -1,5 +1,5 @@
 import type { PaintCanvas } from './canvas.ts';
-import { albedoField, occlusionField, occlusionFilter, surfaceField } from './relight.ts';
+import { canvasFields, occlusionFilter, type CanvasFields } from './relight.ts';
 import { srgbToLinear } from './pigment.ts';
 
 /**
@@ -23,9 +23,13 @@ export interface ImpastoSurface {
   color: Float32Array;
 }
 
-/** Packs a painted canvas into an ImpastoSurface. Pure data, so it can cross a worker or a file. */
-export function surfaceFromCanvas(c: PaintCanvas): ImpastoSurface {
-  const S = surfaceField(c), O = occlusionField(c), A = albedoField(c);
+/**
+ * Packs a painted canvas into an ImpastoSurface. Pure data, so it can cross a worker or a file.
+ * `fields` (relight.ts canvasFields at relief 1) lets a caller that also relights the canvas
+ * derive the height and albedo fields once.
+ */
+export function surfaceFromCanvas(c: PaintCanvas, fields?: CanvasFields): ImpastoSurface {
+  const { S, O, A } = fields ?? canvasFields(c);
   const height = new Float32Array(c.n * 2), color = new Float32Array(c.n * 4);
   let maxH = 0;
   for (let i = 0; i < c.n; i++) {
