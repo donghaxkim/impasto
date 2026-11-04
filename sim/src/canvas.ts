@@ -24,6 +24,12 @@ export class PaintCanvas {
   private touched: number[] = [];
   private heapCells: number[] = []; private bermCells: number[] = [];
   private facetMark: Int32Array;
+  /** Scratch buffers reused across strokes, so the hot passes allocate nothing per cell. */
+  private frontier: number[] = [];
+  private pairNbr = new Int32Array(0); private pairLim = new Float64Array(0);
+  private bleedStrength = new Float64Array(0); private bleedOn = new Uint8Array(0);
+  private coneW = new Float64Array(0); private coneExx = new Float64Array(0);
+  private facetTarget: Float64Array | null = null;
 
   constructor(widthMm: number, heightMm: number, dx: number, ground: RGB, seed = 1) {
     this.dx = dx;
@@ -109,11 +115,13 @@ export class PaintCanvas {
     out[0] = out[1] = out[2] = out[3] = 0;
     if (h <= 0 || t <= 0) return;
     const f = h >= t ? 1 : h / t, moved = t * f;
-    const concs = [c0, c1, c2];
-    for (let k = 0; k < 3; k++) {
-      const m = this.topP[i + k] * f, inc = concs[k] * moved;
-      this.topP[i + k] += inc - m; out[k + 1] = m; 
-    }
+    const { topP } = this;
+    let m = topP[i] * f, inc = c0 * moved;
+    topP[i] += inc - m; out[1] = m;
+    m = topP[i + 1] * f; inc = c1 * moved;
+    topP[i + 1] += inc - m; out[2] = m;
+    m = topP[i + 2] * f; inc = c2 * moved;
+    topP[i + 2] += inc - m; out[3] = m;
     out[0] = moved;
   }
 
@@ -132,20 +140,37 @@ export class PaintCanvas {
    */
   cone(xMm: number, yMm: number, radiusMm: number, volume: number, c0: number, c1: number, c2: number, rough: number, kind: 0 | 1 | 2 = 0, sharp = 0): void {
     if (volume <= 0) return;
-    const { dx } = this;
-    const R = Math.max(radiusMm, dx * 1.2);
-    const weight = sharp > 0
-      ? (rr: number) => { if (rr <= 0.15) return 0; const dome = Math.sqrt(rr); return dome + (1 - 0.7 * Math.sqrt(1 - rr) - dome) * sharp; }
-      : (rr: number) => (rr > 0.15 ? Math.sqrt(rr) : 0);
+    const { dx, w: W, h: H } = this;
+    const R = Math.max(radiusMm, dx * 1.2), RR = R * R;
     const x0 = Math.floor((xMm - R) / dx), x1 = Math.ceil((xMm + R) / dx);
     const y0 = Math.floor((yMm - R) / dx), y1 = Math.ceil((yMm + R) / dx);
+    const nx = x1 - x0 + 1, ny = y1 - y0 + 1;
+    // Weights are computed once into a scratch buffer and read back in the deposit pass.
+    let ws = this.coneW, exx = this.coneExx;
+    if (ws.length < nx * ny) ws = this.coneW = new Float64Array(Math.max(nx * ny, ws.length * 2));
+    if (exx.length < nx) exx = this.coneExx = new Float64Array(Math.max(nx, exx.length * 2));
+    for (let x = x0; x <= x1; x++) { const ex = (x + 0.5) * dx - xMm; exx[x - x0] = ex * ex; }
     // Weights cover the whole cone: whatever falls past the canvas edge is recorded as lost
     // and never piled onto the few cells that remain inside.
-    let sum = 0, inside = 0;
-    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
-      const ex = (x + 0.5) * dx - xMm, ey = (y + 0.5) * dx - yMm;
-      const rr = 1 - (ex * ex + ey * ey) / (R * R), w = weight(rr);
-      if (w > 0) { sum += w; if (this.inBounds(x, y)) inside += w; }
+    let sum = 0, inside = 0, i = 0;
+    for (let y = y0; y <= y1; y++) {
+      const ey = (y + 0.5) * dx - yMm, eyy = ey * ey, yin = y >= 0 && y < H;
+      if (sharp > 0) {
+        for (let x = x0; x <= x1; x++, i++) {
+          const rr = 1 - (exx[x - x0] + eyy) / RR;
+          let w = 0;
+          if (!(rr <= 0.15)) { const dome = Math.sqrt(rr); w = dome + (1 - 0.7 * Math.sqrt(1 - rr) - dome) * sharp; }
+          ws[i] = w;
+          if (w > 0) { sum += w; if (x >= 0 && yin && x < W) inside += w; }
+        }
+      } else {
+        for (let x = x0; x <= x1; x++, i++) {
+          const rr = 1 - (exx[x - x0] + eyy) / RR;
+          const w = rr > 0.15 ? Math.sqrt(rr) : 0;
+          ws[i] = w;
+          if (w > 0) { sum += w; if (x >= 0 && yin && x < W) inside += w; }
+        }
+      }
     }
     if (sum <= 0) sum = inside = 1;
     const lostVolume = volume * (1 - inside / sum);
@@ -154,17 +179,18 @@ export class PaintCanvas {
     }
     if (inside <= 0) return;
     const thick = volume / (sum * dx * dx);
-    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
-      if (!this.inBounds(x, y)) continue;
-      const ex = (x + 0.5) * dx - xMm, ey = (y + 0.5) * dx - yMm;
-      const rr = 1 - (ex * ex + ey * ey) / (R * R), w = weight(rr);
-      if (w > 0) {
-        const c = y * this.w + x;
-        this.mark(c);
-        this.add(c, thick * w, c0, c1, c2); this.rough[c] = rough;
-        if (kind !== 0 && this.facetMark[c] !== this.strokeId * 2 + kind) {
-          this.facetMark[c] = this.strokeId * 2 + kind;
-          (kind === 1 ? this.heapCells : this.bermCells).push(c);
+    const { rough: roughA, facetMark } = this, fid = this.strokeId * 2 + kind;
+    const facetList = kind === 1 ? this.heapCells : this.bermCells;
+    const ya = Math.max(y0, 0), yb = Math.min(y1, H - 1), xa = Math.max(x0, 0), xb = Math.min(x1, W - 1);
+    for (let y = ya; y <= yb; y++) {
+      let i = (y - y0) * nx + (xa - x0);
+      for (let x = xa; x <= xb; x++, i++) {
+        const w = ws[i];
+        if (w > 0) {
+          const c = y * W + x;
+          this.mark(c);
+          this.add(c, thick * w, c0, c1, c2); roughA[c] = rough;
+          if (kind !== 0 && facetMark[c] !== fid) { facetMark[c] = fid; facetList.push(c); }
         }
       }
     }
@@ -175,18 +201,20 @@ export class PaintCanvas {
     const { w, h, dx } = this;
     const X0 = Math.max(1, x0), Y0 = Math.max(1, y0), X1 = Math.min(w - 2, x1), Y1 = Math.min(h - 2, y1);
     const limit = maxSlope * dx;
-    const neighbours = [1, w];
+    const { tooth, top, under } = this;
     for (let it = 0; it < iterations; it++) {
       for (let y = Y0; y <= Y1; y++) for (let x = X0; x <= X1; x++) {
         const c = y * w + x;
-        const sc = this.tooth[c] + this.top[c] + this.under[c];
-        for (let q = 0; q < 2; q++) {
-          const d = c + neighbours[q];
-          const sd = this.tooth[d] + this.top[d] + this.under[d];
-          const diff = sc - sd;
-          if (diff > limit) this.moveTo(c, d, (diff - limit) * 0.5);
-          else if (-diff > limit) this.moveTo(d, c, (-diff - limit) * 0.5);
-        }
+        // The cell's own height is read once for both neighbours, as before.
+        const sc = tooth[c] + top[c] + under[c];
+        let d = c + 1;
+        let diff = sc - (tooth[d] + top[d] + under[d]);
+        if (diff > limit) this.moveTo(c, d, (diff - limit) * 0.5);
+        else if (-diff > limit) this.moveTo(d, c, (-diff - limit) * 0.5);
+        d = c + w;
+        diff = sc - (tooth[d] + top[d] + under[d]);
+        if (diff > limit) this.moveTo(c, d, (diff - limit) * 0.5);
+        else if (-diff > limit) this.moveTo(d, c, (-diff - limit) * 0.5);
       }
     }
   }
@@ -194,14 +222,19 @@ export class PaintCanvas {
   level(x0: number, y0: number, x1: number, y1: number, rate: number, iterations: number): void {
     const { w, h } = this;
     const X0 = Math.max(1, x0), Y0 = Math.max(1, y0), X1 = Math.min(w - 2, x1), Y1 = Math.min(h - 2, y1);
+    const { tooth, top, under } = this;
     for (let it = 0; it < iterations; it++) {
       for (let y = Y0; y <= Y1; y++) for (let x = X0; x <= X1; x++) {
         const c = y * w + x;
-        for (const d of [c + 1, c + w]) {
-          const diff = this.surface(c) - this.surface(d);
-          if (diff > 0.004 && this.top[c] + this.under[c] > 0) this.moveTo(c, d, diff * rate);
-          else if (diff < -0.004 && this.top[d] + this.under[d] > 0) this.moveTo(d, c, -diff * rate);
-        }
+        // The cell's height is re-read for the second neighbour: the first move may have changed it.
+        let d = c + 1;
+        let diff = (tooth[c] + top[c] + under[c]) - (tooth[d] + top[d] + under[d]);
+        if (diff > 0.004 && top[c] + under[c] > 0) this.moveTo(c, d, diff * rate);
+        else if (diff < -0.004 && top[d] + under[d] > 0) this.moveTo(d, c, -diff * rate);
+        d = c + w;
+        diff = (tooth[c] + top[c] + under[c]) - (tooth[d] + top[d] + under[d]);
+        if (diff > 0.004 && top[c] + under[c] > 0) this.moveTo(c, d, diff * rate);
+        else if (diff < -0.004 && top[d] + under[d] > 0) this.moveTo(d, c, -diff * rate);
       }
     }
   }
@@ -227,17 +260,22 @@ export class PaintCanvas {
 
   /** Relaxes the sheared face of a knife stroke to a smooth plane. Only moves paint under the visible layer. */
   levelFace(cells: number[], mask: Int32Array, id: number, rate: number, iterations: number): void {
-    const { w, under } = this;
+    const { w, n, tooth, top, under, underP } = this;
     for (let it = 0; it < iterations; it++) {
-      for (const c of cells) {
-        for (const d of [c + 1, c + w]) {
-          if (d >= this.n || mask[d] !== id || (d === c + 1 && d % w === 0)) continue;
-          const diff = this.surface(c) - this.surface(d);
+      for (let ci = 0, nc = cells.length; ci < nc; ci++) {
+        const c = cells[ci];
+        for (let q = 0; q < 2; q++) {
+          const d = q === 0 ? c + 1 : c + w;
+          if (d >= n || mask[d] !== id || (q === 0 && d % w === 0)) continue;
+          const diff = (tooth[c] + top[c] + under[c]) - (tooth[d] + top[d] + under[d]);
           const from = diff > 0 ? c : d, to = diff > 0 ? d : c;
           const h = Math.min((diff > 0 ? diff : -diff) * rate, under[from]);
           if (h <= 0) continue;
           const f = h >= under[from] ? 1 : h / under[from];
-          for (let k = 0; k < 3; k++) { const m = this.underP[from * 3 + k] * f; this.underP[from * 3 + k] -= m; this.underP[to * 3 + k] += m; }
+          const f3 = from * 3, t3 = to * 3;
+          let m = underP[f3] * f; underP[f3] -= m; underP[t3] += m;
+          m = underP[f3 + 1] * f; underP[f3 + 1] -= m; underP[t3 + 1] += m;
+          m = underP[f3 + 2] * f; underP[f3 + 2] -= m; underP[t3 + 2] += m;
           under[from] = f === 1 ? 0 : under[from] - h;
           under[to] += h;
         }
@@ -365,64 +403,96 @@ export class PaintCanvas {
    * into a fillet and pigment bleeds across the join. Edges on bare canvas are left steep.
    */
   blendWetContact(seed: number, stiffness = 0): void {
-    const { w, n, dx, top, under } = this, id = this.strokeId;
+    const { w, n, dx, tooth, top, under, band, bandDist, touch } = this, id = this.strokeId;
     // Stiff paint (high yield stress) holds a real step: where neighbouring cells differ by more
     // than `tall`, the fillet only knocks off what is steeper than about 80 degrees. Smaller steps
     // (thin films caught on the weave, the skirt of a berm) still relax, so nothing reads as voxels.
     // Pigment barely bleeds across the join.
     const hold = stiffness > 0 ? 1 + 5 * stiffness : 1, bleed = stiffness > 0 ? 1 - 0.9 * stiffness : 1;
     const tall = stiffness > 0 ? 1.5 * dx : 0;
-    const paint = (c: number) => top[c] + under[c];
     const radius = Math.max(3, Math.round(0.8 / dx));
-    const frontier: number[] = [];
-    const seedBand = (c: number) => { if (this.band[c] !== id) { this.band[c] = id; this.bandDist[c] = 0; frontier.push(c); } };
-    for (const c of this.touched) {
-      if (paint(c) <= 0.04) continue;
+    const frontier = this.frontier; frontier.length = 0;
+    // Seeds: touched cells with paint next to untouched paint, in the order right, left, down, up.
+    const touched = this.touched;
+    for (let i = 0, nt = touched.length; i < nt; i++) {
+      const c = touched[i];
+      if (top[c] + under[c] <= 0.04) continue;
       const x = c % w;
-      for (const d of [x + 1 < w ? c + 1 : -1, x > 0 ? c - 1 : -1, c + w < n ? c + w : -1, c - w >= 0 ? c - w : -1]) {
-        if (d >= 0 && this.touch[d] !== id && paint(d) > 0.12) { seedBand(c); seedBand(d); }
+      for (let q = 0; q < 4; q++) {
+        const d = q === 0 ? (x + 1 < w ? c + 1 : -1) : q === 1 ? (x > 0 ? c - 1 : -1) : q === 2 ? (c + w < n ? c + w : -1) : (c - w >= 0 ? c - w : -1);
+        if (d >= 0 && touch[d] !== id && top[d] + under[d] > 0.12) {
+          if (band[c] !== id) { band[c] = id; bandDist[c] = 0; frontier.push(c); }
+          if (band[d] !== id) { band[d] = id; bandDist[d] = 0; frontier.push(d); }
+        }
       }
     }
     if (!frontier.length) return;
     for (let i = 0; i < frontier.length; i++) {
-      const c = frontier[i], dist = this.bandDist[c];
+      const c = frontier[i], dist = bandDist[c];
       if (dist >= radius) continue;
       const x = c % w;
-      for (const d of [x + 1 < w ? c + 1 : -1, x > 0 ? c - 1 : -1, c + w < n ? c + w : -1, c - w >= 0 ? c - w : -1]) {
-        if (d >= 0 && this.band[d] !== id && paint(d) > 0.04) { this.band[d] = id; this.bandDist[d] = dist + 1; frontier.push(d); }
+      for (let q = 0; q < 4; q++) {
+        const d = q === 0 ? (x + 1 < w ? c + 1 : -1) : q === 1 ? (x > 0 ? c - 1 : -1) : q === 2 ? (c + w < n ? c + w : -1) : (c - w >= 0 ? c - w : -1);
+        if (d >= 0 && band[d] !== id && top[d] + under[d] > 0.04) { band[d] = id; bandDist[d] = dist + 1; frontier.push(d); }
+      }
+    }
+    // The band is fixed from here on, so each cell's right and down partners and the base of their
+    // slope limit are worked out once instead of on every pass.
+    const nf = frontier.length;
+    let nbr = this.pairNbr, lim = this.pairLim;
+    if (nbr.length < nf * 2) { nbr = this.pairNbr = new Int32Array(Math.max(nf * 2, nbr.length * 2)); lim = this.pairLim = new Float64Array(nbr.length); }
+    for (let i = 0; i < nf; i++) {
+      const c = frontier[i], x = c % w;
+      for (let q = 0; q < 2; q++) {
+        const d = q === 0 ? (x + 1 < w ? c + 1 : -1) : (c + w < n ? c + w : -1);
+        if (d < 0 || band[d] !== id) { nbr[i * 2 + q] = -1; continue; }
+        nbr[i * 2 + q] = d;
+        const near = Math.min(bandDist[c], bandDist[d]) / radius;
+        lim[i * 2 + q] = dx * (0.75 + 1.0 * near);
       }
     }
     // The fillet: steepness allowed grows with distance from the join.
     for (let it = 0; it < 9; it++) {
-      for (const c of frontier) {
-        const x = c % w;
-        for (const d of [x + 1 < w ? c + 1 : -1, c + w < n ? c + w : -1]) {
-          if (d < 0 || this.band[d] !== id) continue;
-          const near = Math.min(this.bandDist[c], this.bandDist[d]) / radius;
-          const diff = this.surface(c) - this.surface(d);
-          const limit = dx * (0.75 + 1.0 * near) * (diff > tall || -diff > tall ? hold : 1);
+      for (let i = 0; i < nf; i++) {
+        const c = frontier[i];
+        for (let q = 0; q < 2; q++) {
+          const d = nbr[i * 2 + q];
+          if (d < 0) continue;
+          const diff = (tooth[c] + top[c] + under[c]) - (tooth[d] + top[d] + under[d]);
+          const base = lim[i * 2 + q];
+          const limit = diff > tall || -diff > tall ? base * hold : base;
           if (diff > limit) this.moveTo(c, d, (diff - limit) * 0.5);
           else if (-diff > limit) this.moveTo(d, c, (-diff - limit) * 0.5);
         }
       }
     }
     // Colour bleed: short irregular fingers along the join, not a uniform blur. Conserves pigment.
+    // The gate depends only on the cell, so it is evaluated once rather than on each of the 8 passes.
     const reach = Math.max(2, Math.round(0.45 / dx));
     const { topP } = this;
+    let strength = this.bleedStrength, on = this.bleedOn;
+    if (strength.length < nf) { strength = this.bleedStrength = new Float64Array(Math.max(nf, strength.length * 2)); on = this.bleedOn = new Uint8Array(strength.length); }
+    for (let i = 0; i < nf; i++) {
+      const c = frontier[i], dist = bandDist[c];
+      on[i] = 0;
+      if (dist > reach) continue;
+      const x = c % w, y = (c - x) / w;
+      const gate = smooth((noise2(x * dx * 1.3, y * dx * 1.3, seed + 31) - 0.42) / 0.16);
+      if (gate <= 0) continue;
+      strength[i] = 0.2 * (1 - dist / (reach + 1)) * gate * bleed;
+      on[i] = 1;
+    }
     for (let it = 0; it < 8; it++) {
-      for (const c of frontier) {
-        const dist = this.bandDist[c];
-        if (dist > reach) continue;
-        const x = c % w, y = (c - x) / w;
-        const gate = smooth((noise2(x * dx * 1.3, y * dx * 1.3, seed + 31) - 0.42) / 0.16);
-        if (gate <= 0) continue;
-        const strength = 0.2 * (1 - dist / (reach + 1)) * gate * bleed;
-        for (const d of [x + 1 < w ? c + 1 : -1, c + w < n ? c + w : -1]) {
-          if (d < 0 || this.band[d] !== id || top[c] <= 1e-6 || top[d] <= 1e-6) continue;
-          const shared = Math.min(top[c], top[d]) * strength;
+      for (let i = 0; i < nf; i++) {
+        if (on[i] === 0) continue;
+        const c = frontier[i], s = strength[i], c3 = c * 3;
+        for (let q = 0; q < 2; q++) {
+          const d = nbr[i * 2 + q];
+          if (d < 0 || top[c] <= 1e-6 || top[d] <= 1e-6) continue;
+          const shared = Math.min(top[c], top[d]) * s, d3 = d * 3;
           for (let k = 0; k < 3; k++) {
-            const flux = shared * (topP[c * 3 + k] / top[c] - topP[d * 3 + k] / top[d]);
-            topP[c * 3 + k] -= flux; topP[d * 3 + k] += flux;
+            const flux = shared * (topP[c3 + k] / top[c] - topP[d3 + k] / top[d]);
+            topP[c3 + k] -= flux; topP[d3 + k] += flux;
           }
         }
       }
