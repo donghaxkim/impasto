@@ -43,7 +43,7 @@ ctx.putImageData(new ImageData(result.image.data, result.image.width), 0, 0); //
 
 // Live light: WebGPU where available, otherwise the CPU image above (see "Live viewer").
 import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';
-const viewer = await createImpastoViewer(canvasEl, result.surface, { look: 'oil', fallback: result.image });
+const viewer = await createImpastoViewer(canvasEl, result.surface, { look: result.light.look, light: result.light, fallback: result.image });
 attachPointerLight(viewer);
 ```
 
@@ -53,10 +53,10 @@ attachPointerLight(viewer);
 - **Presets** (`src/presets.ts`), each a few overrides on `DEFAULT_SETTINGS` and `DEFAULT_LIGHT`, so planner defaults flow through:
   - `'oil'` (default): the planner's `oil` look with all its defaults, semi-gloss renderer.
   - `'locked'`: the round-3 reference look, identical to `npm run paint -- --look locked` (a test pins it).
-  - `'smooth'`: `oil` with more restraint, single-colour (unstreaked) loads, thinner knife paint, lights laid less thick, fewer detail and accent marks, slightly less saturation, a higher lamp, shallower shadows, less shading relief and glow.
+  - `'smooth'`: `oil` with more restraint, single-colour (unstreaked) loads, thinner knife paint (except the presses layer, which the planner adds with its own thickness), lights laid less thick, fewer detail and accent marks, slightly less saturation, a higher lamp, shallower shadows, less shading relief and glow.
 - `options.advanced` takes raw `PlanSettings` over the preset. It is unstable: names and meanings change without notice.
 - **Size and time:** the canvas is simulated at 0.1 mm, so time and memory grow with its area: the 1440 x 692 lake photo at the default 240 mm width (240 x 115 mm, 1487 strokes) took 1 min 45 s of CPU (4 min wall on a busy 2-core machine) and 0.8 GB peak; 360 x 240 mm is about three times the area. `widthMm` is clamped to 20 mm and to a longest side of 480 mm (`canvasWidthMm` gives the width that will be used). Images up to 50 megapixels and 8:1 are accepted; pixels beyond the canvas's 0.5 mm analysis grid add nothing, so downscale large photos first.
-- **Errors:** bad input rejects with `ImpastoError` and a `code`: `UNSUPPORTED_SOURCE`, `EMPTY_IMAGE`, `BAD_DATA`, `BAD_ASPECT`, `IMAGE_TOO_LARGE`, `DECODE_FAILED`, `BAD_OPTION`. Alpha is composited over white.
+- **Errors:** bad input rejects with `ImpastoError` and a `code`: `UNSUPPORTED_SOURCE`, `EMPTY_IMAGE`, `BAD_DATA`, `BAD_ASPECT`, `IMAGE_TOO_LARGE`, `DECODE_FAILED`, `BAD_OPTION`, and from the worker helpers `WORKER_FAILED` (the worker failed to load or crashed). Alpha is composited over white.
 - `planImpasto(image, options)` returns just the stroke plan in seconds (planned without the simulation, so it differs from what `renderImpasto` paints).
 - **Off the main thread:** between layers the render yields to the event loop, but each layer is seconds to a minute of synchronous work, so on a page use the worker:
 

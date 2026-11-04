@@ -27,7 +27,8 @@ export type WorkerResponse =
 
 /** The part of Worker / MessagePort / a worker's global scope used here. */
 export interface MessagePortLike {
-  postMessage(message: unknown, transfer?: ArrayBuffer[]): void;
+  // Required (not optional) so a DOM MessagePort or DedicatedWorkerGlobalScope is assignable.
+  postMessage(message: unknown, transfer: any[]): void;
   addEventListener(type: 'message', listener: (e: { data: unknown }) => void): void;
   removeEventListener(type: 'message', listener: (e: { data: unknown }) => void): void;
   start?(): void;
@@ -43,20 +44,20 @@ export function serveImpasto(port: MessagePortLike): void {
     if (req.type !== 'render' && req.type !== 'plan') return;
     const ac = new AbortController();
     running.set(req.id, ac);
-    const options: ImpastoOptions = { ...req.options, signal: ac.signal, onProgress: (info) => port.postMessage({ type: 'progress', id: req.id, info } satisfies WorkerResponse) };
+    const options: ImpastoOptions = { ...req.options, signal: ac.signal, onProgress: (info) => port.postMessage({ type: 'progress', id: req.id, info } satisfies WorkerResponse, []) };
     const job: Promise<ImpastoResult | ImpastoPlanResult> = req.type === 'render' ? renderImpasto(req.image, options) : planImpasto(req.image, options);
     job.then((result) => {
       const transfer = 'image' in result ? [result.image.data.buffer, result.surface.height.buffer, result.surface.color.buffer] as ArrayBuffer[] : [];
       port.postMessage({ type: 'result', id: req.id, result } satisfies WorkerResponse, transfer);
     }, (err: unknown) => {
       const x = err as { name?: unknown; message?: unknown; code?: unknown };
-      port.postMessage({ type: 'error', id: req.id, error: { name: String(x?.name ?? 'Error'), message: String(x?.message ?? err), code: typeof x?.code === 'string' ? x.code : undefined } } satisfies WorkerResponse);
+      port.postMessage({ type: 'error', id: req.id, error: { name: String(x?.name ?? 'Error'), message: String(x?.message ?? err), code: typeof x?.code === 'string' ? x.code : undefined } } satisfies WorkerResponse, []);
     }).finally(() => running.delete(req.id));
   });
   port.start?.();
 }
 
-// In a dedicated or shared worker, serve on the worker's own scope. Elsewhere (Node, the page)
-// importing this module does nothing.
-const WGS = (globalThis as Record<string, unknown>).WorkerGlobalScope;
-if (typeof WGS === 'function' && globalThis instanceof (WGS as new () => object)) serveImpasto(globalThis as unknown as MessagePortLike);
+// In a dedicated worker, serve on the worker's own scope. Elsewhere (Node, the page) importing this
+// module does nothing. A SharedWorker would need serveImpasto(port) for each 'connect' event's port.
+const DWGS = (globalThis as Record<string, unknown>).DedicatedWorkerGlobalScope;
+if (typeof DWGS === 'function' && globalThis instanceof (DWGS as new () => object)) serveImpasto(globalThis as unknown as MessagePortLike);

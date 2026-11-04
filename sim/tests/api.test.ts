@@ -202,3 +202,20 @@ test('api: worker protocol over a MessageChannel', async () => {
     await assert.rejects(planInWorker(port1 as never, img, { ...opts, signal: ac.signal, onProgress: (p) => { if (p.stage === 'paint') ac.abort(); } }), isAbort);
   } finally { port1.close(); port2.close(); }
 });
+
+test('api: worker calls reject instead of hanging when the job cannot be sent or the worker fails', async () => {
+  // A Proxy (e.g. a Vue reactive object) cannot be structured-cloned: postMessage throws.
+  const { port1, port2 } = new MessageChannel();
+  serveImpasto(port2 as never);
+  try {
+    const img = tiny();
+    await assert.rejects(planInWorker(port1 as never, new Proxy(img, {}), { widthMm: 24 }), hasCode('BAD_OPTION'));
+  } finally { port1.close(); port2.close(); }
+  // A worker that errors (failed to load, crashed) rejects with WORKER_FAILED and detaches its listeners.
+  const fake = new EventTarget() as EventTarget & { postMessage(): void };
+  fake.postMessage = () => {};
+  const job = planInWorker(fake as never, tiny(), { widthMm: 24 });
+  await new Promise((r) => setTimeout(r, 0));
+  fake.dispatchEvent(Object.assign(new Event('error'), { message: 'boom' }));
+  await assert.rejects(job, hasCode('WORKER_FAILED'));
+});

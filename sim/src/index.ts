@@ -41,7 +41,9 @@ export type ImpastoErrorCode =
   /** The browser could not decode the image. */
   | 'DECODE_FAILED'
   /** An option has the wrong type or value. */
-  | 'BAD_OPTION';
+  | 'BAD_OPTION'
+  /** renderInWorker / planInWorker: the worker failed to load, crashed, or sent something unreadable. */
+  | 'WORKER_FAILED';
 
 export class ImpastoError extends Error {
   readonly code: ImpastoErrorCode;
@@ -394,8 +396,8 @@ export async function planImpasto(image: ImpastoImageSource, options: ImpastoOpt
 /** A Worker running `impasto-sim/worker`, or a MessagePort served by `serveImpasto`. */
 export interface ImpastoWorkerLike {
   postMessage(message: unknown, transfer?: unknown[]): void;
-  addEventListener(type: 'message', listener: (e: { data: unknown }) => void): void;
-  removeEventListener(type: 'message', listener: (e: { data: unknown }) => void): void;
+  addEventListener(type: 'message' | 'error' | 'messageerror', listener: (e: any) => void): void;
+  removeEventListener(type: 'message' | 'error' | 'messageerror', listener: (e: any) => void): void;
   start?(): void;
 }
 
@@ -406,8 +408,20 @@ function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image
   return new Promise<T>((resolve, reject) => {
     if (signal?.aborted) { reject(abortError(signal)); return; }
     const id = nextId++;
-    const done = (): void => { worker.removeEventListener('message', onMessage); signal?.removeEventListener('abort', onAbort); };
-    const onAbort = (): void => { worker.postMessage({ type: 'abort', id }); done(); reject(abortError(signal!)); };
+    let settled = false;
+    const done = (): void => {
+      settled = true;
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+      worker.removeEventListener('messageerror', onError);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const fail = (err: unknown): void => { if (!settled) { done(); reject(err); } };
+    const onAbort = (): void => { try { worker.postMessage({ type: 'abort', id }); } catch { /* the worker is gone */ } fail(abortError(signal!)); };
+    // A worker that fails to load, throws at top level or runs out of memory reports here, not on 'message'.
+    const onError = (e: { message?: string; type?: string }): void => {
+      fail(new ImpastoError('WORKER_FAILED', `the impasto worker failed${e?.message ? `: ${e.message}` : e?.type === 'messageerror' ? ': a message could not be deserialised' : ''}`));
+    };
     const onMessage = (e: { data: unknown }): void => {
       const m = e.data as { type: string; id: number; info?: ProgressInfo; result?: T; error?: { name: string; message: string; code?: string } };
       if (!m || m.id !== id) return;
@@ -421,13 +435,20 @@ function callWorker<T>(worker: ImpastoWorkerLike, type: 'render' | 'plan', image
       }
     };
     worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    worker.addEventListener('messageerror', onError);
     worker.start?.();
     signal?.addEventListener('abort', onAbort, { once: true });
     // Pixels, Blobs and ImageBitmaps can be posted; image elements and canvases are read here first.
     const cloneable = 'data' in (image as object) || isInstance(image, 'Blob') || isInstance(image, 'ImageBitmap');
     (cloneable ? Promise.resolve(image) : imageToPixels(image)).then(
-      (img) => { if (!signal?.aborted) worker.postMessage({ type, id, image: img, options: rest }); },
-      (err) => { done(); reject(err); },
+      (img) => {
+        if (settled || signal?.aborted) return;
+        // postMessage throws synchronously for what it cannot clone (a Proxy, e.g. a Vue reactive object, or a function).
+        try { worker.postMessage({ type, id, image: img, options: rest }); }
+        catch (e) { fail(new ImpastoError('BAD_OPTION', `could not send the job to the worker: ${(e as Error).message} (pass plain data, not reactive proxies or functions)`)); }
+      },
+      fail,
     );
   });
 }

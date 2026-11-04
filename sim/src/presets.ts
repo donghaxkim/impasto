@@ -47,7 +47,9 @@ export const PRESETS: Record<PresetName, Preset> = {
       // A little less saturation than the photo-boosted default.
       chroma: 1 + (d.chroma - 1) * 0.5,
       layers: d.layers.map((l) => {
-        // Thinner paint everywhere except the underpainting: lower relief, smaller berms and heaps.
+        // Thinner paint on the knife layers listed here (not the underpainting): lower relief, smaller
+        // berms and heaps. The presses layer is added later inside the planner, so it keeps its own
+        // paint thickness (gapMm 0.3) and its presses stand a little prouder than in 'oil'.
         const thin = l.tool === 'knife' ? { ...l, gapMm: l.gapMm * 0.8 } : l;
         // Fewer, only the clearest accents and detail marks: a higher error threshold to seed one.
         if (l.name === 'accents') return { ...thin, threshold: l.threshold * 1.6 };

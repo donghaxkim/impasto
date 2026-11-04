@@ -90,7 +90,8 @@ async function initGpu(gpu: GPU | null | undefined, canvas: HTMLCanvasElement, s
   const maxDim = adapter.limits.maxTextureDimension2D;
   if (s.w > maxDim || s.h > maxDim) return `surface ${s.w}x${s.h} exceeds this GPU's texture limit of ${maxDim}`;
   let device: GPUDevice;
-  try { device = await adapter.requestDevice(); } catch (e) { return `requestDevice failed: ${(e as Error).message}`; }
+  // Ask for the adapter's full texture size: the default device limit is 8192 whatever the GPU supports.
+  try { device = await adapter.requestDevice({ requiredLimits: { maxTextureDimension2D: maxDim } }); } catch (e) { return `requestDevice failed: ${(e as Error).message}`; }
   const fail = (why: string) => { device.destroy(); return why; };
   const context = canvas.getContext('webgpu');
   if (!context) return fail('the canvas has no WebGPU context (it may already hold a 2D one)');
