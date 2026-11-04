@@ -1,17 +1,56 @@
 {
   "name": "impasto-sim",
   "private": true,
+  "version": "0.1.0",
+  "description": "Deterministic palette-knife impasto painting simulation: photo in, painted and relightable canvas out.",
   "type": "module",
+  "sideEffects": [
+    "./dist/worker.js",
+    "./src/worker.ts"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "source": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "source": "./src/worker.ts",
+      "default": "./dist/worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "scripts",
+    "tsconfig.json",
+    "tsconfig.build.json",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "render": "node --experimental-strip-types --no-warnings tests/render.ts",
     "viewer": "node --experimental-strip-types --no-warnings tests/export-viewer.ts",
-    "test": "node --experimental-strip-types --no-warnings --test tests/sim.test.ts tests/primitives.test.ts tests/planner.test.ts tests/surface.test.ts tests/bench.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test tests/sim.test.ts tests/primitives.test.ts tests/planner.test.ts tests/surface.test.ts tests/bench.test.ts tests/api.test.ts",
     "test:planner": "node --experimental-strip-types --no-warnings --test tests/planner.test.ts",
     "paint": "node --experimental-strip-types --no-warnings --max-old-space-size=6000 tests/paint-image.ts",
     "forms": "node --experimental-strip-types --no-warnings tests/forms-image.ts",
     "diagnose": "node --experimental-strip-types --no-warnings --max-old-space-size=6000 tests/diagnose.ts",
     "test:viewer": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 tests/viewer.browser.ts",
     "gpu-parity": "node --experimental-strip-types --no-warnings tests/gpu-parity.ts",
-    "bench": "node --experimental-strip-types --no-warnings tests/bench.ts"
+    "bench": "node --experimental-strip-types --no-warnings tests/bench.ts",
+    "build": "node scripts/build.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepare": "node scripts/build.js --prepare",
+    "test:api": "node --experimental-strip-types --no-warnings --test tests/api.test.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

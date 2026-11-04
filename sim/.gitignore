@@ -3,3 +3,5 @@ _to_delete/
 .w
 scenes/
 refs/
+dist/
+node_modules/
