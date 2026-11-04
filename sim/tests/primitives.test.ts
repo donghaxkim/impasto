@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { PaintCanvas } from '../src/canvas.ts';
-import { paintStroke, Tool, yieldVolume, type StrokeSpec } from '../src/tool.ts';
+import { contactProfile, paintStroke, Tool, yieldVolume, type StrokeSpec } from '../src/tool.ts';
 
 const GROUND = [0.58, 0.47, 0.37] as const, BLUE = [0.2, 0.5, 0.75] as const, CREAM = [0.9, 0.9, 0.85] as const;
 const fingerprint = (c: PaintCanvas) => createHash('sha256').update(Buffer.from(c.top.buffer)).update(Buffer.from(c.under.buffer)).update(Buffer.from(c.topP.buffer)).digest('hex');
@@ -74,4 +74,67 @@ test('heap: 0 lifts cleanly, 1.5 sheds more than the usual heap, and paint is co
   for (const m of [none, usual, big]) conserved(m);
   assert.equal(none.stats.heapVolume, 0);
   assert.ok(big.stats.heapVolume > usual.stats.heapVolume * 1.2, `${big.stats.heapVolume.toFixed(1)} vs ${usual.stats.heapVolume.toFixed(1)}`);
+});
+
+/** Mean berm and heap volume over a few seeds, for a 10 mm knife pulled 40 mm with physical deposition. */
+function physical(extra: Partial<StrokeSpec>, loadMul = 1, pts?: [number, number][]) {
+  let berm = 0, heap = 0;
+  for (const seed of [1, 2, 3, 4]) {
+    const canvas = new PaintCanvas(70, 60, 0.1, GROUND, 3);
+    const tool = new Tool({ kind: 'knife', widthMm: 10, nodes: 120, seed: 10 + seed });
+    tool.load(Math.max(tool.pitch * 0.45 * 40 * 1.15, 6 * yieldVolume('knife', tool.pitch, 40)) * loadMul, BLUE, CREAM, 0.2, 100 + seed);
+    const st = paintStroke(canvas, tool, { points: pts ?? [[10, 30], [23, 30], [37, 30], [50, 30]], gapMm: 0.45, seed: 1000 + seed, deposition: 'physical', ...extra });
+    const held = canvas.totalVolume() + canvas.lost + tool.residual() + tool.wiped;
+    assert.ok(Math.abs(tool.loaded - held) / tool.loaded < 1e-9, 'volume conserved');
+    berm += st.bermVolume / 4; heap += st.heapVolume / 4;
+  }
+  return { berm, heap };
+}
+
+test('physical deposition: berms grow with pressure, a flatter blade and more load; the heap with lift pressure', () => {
+  const p = [0.5, 1, 1.4].map((v) => physical({ pressure: [v] }));
+  assert.ok(p[0].berm < p[1].berm && p[1].berm < p[2].berm, `berm by pressure ${p.map((x) => x.berm.toFixed(1))}`);
+  assert.ok(p[0].heap < p[1].heap && p[1].heap < p[2].heap, `heap by pressure ${p.map((x) => x.heap.toFixed(1))}`);
+  const flat = physical({ attackDeg: 10 }), steep = physical({ attackDeg: 60 });
+  assert.ok(flat.berm > steep.berm * 1.15, `flat ${flat.berm.toFixed(1)} vs steep ${steep.berm.toFixed(1)}`);
+  const light = physical({}, 0.6), heavy = physical({}, 2.5);
+  assert.ok(heavy.berm > light.berm * 2.5 && heavy.heap > light.heap * 4, `light ${JSON.stringify(light)} heavy ${JSON.stringify(heavy)}`);
+  // A light lift keeps the bead on the knife: a clean end, not a heap.
+  const lifted = physical({ pressure: [1, 1, 1, 0.15] });
+  assert.ok(lifted.heap < p[1].heap * 0.5, `lifted ${lifted.heap.toFixed(1)} vs ${p[1].heap.toFixed(1)}`);
+});
+
+test('physical deposition: on a curve the berm builds on the outside of the turn', () => {
+  // A quarter arc turning toward +y (downward on the canvas): its outside is the upper, outer edge.
+  let outside = 0, inside = 0;
+  for (const seed of [1, 2, 3]) {
+    const canvas = new PaintCanvas(80, 80, 0.1, GROUND, 3);
+    const tool = new Tool({ kind: 'knife', widthMm: 9, nodes: 108, seed: 20 + seed });
+    tool.load(6 * yieldVolume('knife', tool.pitch, 40) * 1.6, BLUE, CREAM, 0.2, 200 + seed);
+    const cx = 20, cy = 60, r = 35, pts: [number, number][] = [];
+    for (let k = 0; k <= 6; k++) { const a = -Math.PI / 2 + k * Math.PI / 12; pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]); }
+    paintStroke(canvas, tool, { points: pts, gapMm: 0.45, seed: 300 + seed, deposition: 'physical' });
+    // Paint beyond the blade's reach on either side, over the middle of the arc.
+    for (let y = 0; y < canvas.h; y++) for (let x = 0; x < canvas.w; x++) {
+      const X = (x + 0.5) * 0.1 - cx, Y = (y + 0.5) * 0.1 - cy, d = Math.hypot(X, Y), ang = Math.atan2(Y, X);
+      if (ang < -Math.PI / 2 + 0.35 || ang > -0.35) continue;
+      const v = canvas.top[y * canvas.w + x] + canvas.under[y * canvas.w + x];
+      if (d > r + 4.7 && d < r + 8) outside += v;
+      if (d < r - 4.7 && d > r - 8) inside += v;
+    }
+  }
+  assert.ok(outside > inside * 1.3, `outside ${outside.toFixed(0)} vs inside ${inside.toFixed(0)}`);
+});
+
+test('pressure profile: a comma mark is narrow at both ends and full in the middle', () => {
+  const m = mark(8, 30, { pressure: [0.2, 1, 1, 1, 0.2] });
+  conserved(m);
+  const mid = widthAt(m.canvas, 25), head = widthAt(m.canvas, 11), prof = contactProfile({ points: [], gapMm: 0, seed: 0, pressure: [0.2, 1, 1, 1, 0.2] }, 30, 5);
+  assert.ok(head < mid * 0.6, `head ${head.toFixed(1)} vs middle ${mid.toFixed(1)}`);
+  assert.deepEqual(prof.map((v) => +v.toFixed(2)), [0.36, 1, 1, 1, 0.36]);
+});
+
+test('deposition: locked is the default and paints exactly as before', () => {
+  const a = mark(10, 30), b = mark(10, 30, { deposition: 'locked', attackDeg: 70, speed: 3 });
+  assert.equal(fingerprint(a.canvas), fingerprint(b.canvas));
 });

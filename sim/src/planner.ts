@@ -79,9 +79,15 @@ export interface LayerSpec {
  * - mark: fine coherent structure (lines, trunks, ridges); tapered both ends, narrower contact.
  * - scumble: fine incoherent texture (foliage, broken rock); broken, starved, little heap.
  * - contour: along a silhouette, one side, tapered tail.
+ * - pat: high-relief incoherent texture; a short, heavy press and lift that leaves an irregular deposit.
  * - accent: a plane or mark in a light, structured area, laid thick with a full heap.
+ *
+ * Primitives set the hand, not the result: a pressure profile along the stroke, the blade's angle,
+ * speed and how much paint is picked up. With physical deposition the berms and heap then follow
+ * from the simulation. Curvature comes from the seed's surroundings: marks and contours follow the
+ * fine edge field and may turn a long way, sweeps follow the broad form field, planes stay stiff.
  */
-export type Primitive = 'underpaint' | 'sweep' | 'plane' | 'mark' | 'scumble' | 'contour' | 'accent';
+export type Primitive = 'underpaint' | 'sweep' | 'plane' | 'mark' | 'scumble' | 'pat' | 'contour' | 'accent';
 
 export interface PlanSettings {
   /** Canvas width in mm; the height follows the image's aspect ratio. */
@@ -140,6 +146,10 @@ export interface PlannedStroke {
   engage: number; taper: [number, number]; taperMin: number; breaks: number; heap: number;
   /** Strength of the knife's edge profile along this stroke (1 = reference). */
   edgeFlaws: number;
+  /** The hand: pressure samples from start to end, blade angle to the canvas, relative speed. */
+  pressure: number[]; attackDeg: number; speed: number;
+  /** 'physical' when berms and heap follow the hand (the 'oil' look); 'locked' otherwise. */
+  deposition: 'locked' | 'physical';
 }
 
 export interface Plan {
@@ -206,6 +216,7 @@ export function planPainting(img: RgbImage, settings: Partial<PlanSettings> = {}
 }
 
 const STEP = 0.25; // Tracing step as a share of the tool width.
+const MIN_RADIUS = 2.5; // Tightest turn a knife makes, in blade widths.
 /**
  * Colour families, each with its own knife: twelve 30-degree hue sectors (turquoise and sky blue
  * are only about 30 degrees apart), each split into dark and light, then dark and light neutrals.
@@ -225,7 +236,7 @@ export function colourFamily(lab: ArrayLike<number>): number {
 }
 const SIDE = 0.36;
 /** Edge-profile strength per primitive in the 'oil' look. */
-const EDGE_FLAWS: Record<Primitive, number> = { underpaint: 1, sweep: 0.15, plane: 0.35, mark: 0.5, contour: 0.4, scumble: 0.65, accent: 0.6 }; // Lateral samples sit this share of the width either side of the centreline.
+const EDGE_FLAWS: Record<Primitive, number> = { underpaint: 1, sweep: 0.15, plane: 0.35, mark: 0.5, contour: 0.4, scumble: 0.65, pat: 0.7, accent: 0.6 }; // Lateral samples sit this share of the width either side of the centreline.
 
 export class Planner {
   readonly s: PlanSettings;
@@ -267,6 +278,8 @@ export class Planner {
     const flow = mergeFields(
       directionField(base, L.flowBlur * W, this.s.flatDirection, this.s.flatBias),
       directionField(base, L.flowBlur * W * 3, this.s.flatDirection, this.s.flatBias), this.s.formWeight);
+    // Marks and contours follow the fine edge field (organic contours); planes and sweeps the merged one.
+    const fineFlow = directionField(base, Math.max(1.5, L.flowBlur * W * 0.6), this.s.flatDirection, this.s.flatBias * 0.5);
     const cur = toOklab(this.current);
     const err = new Float64Array(n);
     for (let i = 0; i < n; i++) err[i] = dist(ref.data, i * 3, cur.data, i * 3);
@@ -278,10 +291,10 @@ export class Planner {
     const st: LayerStats = { seeds: 0, tooShort: 0, overlapping: 0, noGain: 0, accepted: 0, primitives: {} };
     const accepted: Traced[] = [];
     const cosTurn = cosDeg(L.maxTurnDeg);
-    if (L.kind === 'contour') this.seedContours(l, W, ref, flow, err, covered, accepted, st, cosTurn);
+    if (L.kind === 'contour') this.seedContours(l, W, ref, fineFlow, err, covered, accepted, st, cosDeg(Math.max(L.maxTurnDeg, 75)));
     // Coverage layers (threshold 0) keep adding fill passes until no cell is left bare.
     let bare = n;
-    for (let pass = 0; L.kind !== 'contour' && (pass < L.passes || (L.threshold <= 0 && bare > 0 && pass < L.passes + 6)); pass++) {
+    for (let pass = 0; L.kind !== 'contour' && (pass < L.passes || (L.threshold <= 0 && bare > 0 && pass < L.passes + 12)); pass++) {
       const fill = pass >= L.passes;
       // Each pass shifts the seed grid by half a cell, so its seeds fall between the last pass's.
       const step = Math.max(2, Math.floor((fill ? 0.5 : L.spacing) * W + 0.5)), off = pass % 2 ? step >> 1 : 0;
@@ -304,9 +317,11 @@ export class Planner {
       for (const c of cands) {
         if (covered[c.y * gw + c.x]) continue;
         st.seeds++;
-        const t = this.trace(c.x + 0.5, c.y + 0.5, W, L, ref, flow, cosTurn);
+        const style = this.seedStyle(c.x + 0.5, c.y + 0.5, L);
+        const t = this.trace(c.x + 0.5, c.y + 0.5, W, L, ref, style.fine ? fineFlow : flow, style.turnDeg === L.maxTurnDeg ? cosTurn : cosDeg(style.turnDeg), style.lenMul);
         if (!t) { st.tooShort++; continue; }
-        const fp = this.footprint(t.pts, W);
+        // A bristle brush has round ends; a knife has square ones.
+        const fp = this.footprint(t.pts, W, L.tool === 'bristle');
         let cov = 0;
         for (const i of fp) cov += covered[i];
         // A fill pass takes any stroke that closes a hole, however much it overlaps.
@@ -386,9 +401,23 @@ export class Planner {
   }
 
   /** Trace a stroke both ways from (x, y) along the flow. Grid coordinates. */
-  private trace(x0: number, y0: number, W: number, L: LayerSpec, ref: Grid, flow: Grid, cosTurn: number): Traced | null {
+  /**
+   * How a stroke seeded here may move, read from the maps around the seed: flat areas take broad
+   * curved sweeps, fine coherent structure takes long organic marks on the fine field, incoherent
+   * texture takes short strokes, everything else the layer's stiff planes.
+   */
+  private seedStyle(x: number, y: number, L: LayerSpec): { turnDeg: number; fine: boolean; lenMul: number } {
+    if (L.tool === 'bristle' || L.primitives === false) return { turnDeg: L.maxTurnDeg, fine: false, lenMul: 1 };
+    const M = this.maps, F = mapAt(M.flat, M.w, M.h, x, y), D = mapAt(M.detail, M.w, M.h, x, y), C = mapAt(M.coherence, M.w, M.h, x, y);
+    if (F > 0.6) return { turnDeg: Math.max(L.maxTurnDeg, 45), fine: false, lenMul: 1.25 };
+    if (D > 0.45 && C < 0.38) return { turnDeg: L.maxTurnDeg + 10, fine: true, lenMul: 0.6 };
+    if (C > 0.5 && L.widthMm <= 6.5) return { turnDeg: 65, fine: true, lenMul: 1.2 };
+    return { turnDeg: L.maxTurnDeg, fine: false, lenMul: 1 };
+  }
+
+  private trace(x0: number, y0: number, W: number, L: LayerSpec, ref: Grid, flow: Grid, cosTurn: number, lenMul = 1): Traced | null {
     const { gw, gh, cell } = this;
-    const h = W * STEP, minLen = L.minLenMm / cell, maxLen = L.maxLenMm / cell;
+    const h = W * STEP, minLen = L.minLenMm / cell, maxLen = Math.max(minLen * 1.05, L.maxLenMm * lenMul / cell);
     const col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
     let taken = 1;
     const d = new Float64Array(2), m = new Float64Array(2);
@@ -404,6 +433,8 @@ export class Planner {
     // if both ends stop short the stroke is dropped (except in layers that must cover everything),
     // so a knife never smears across an edge just to reach its physical minimum length.
     const loose = L.tolerance * 1.6;
+    // Smallest turning radius: MIN_RADIUS blade widths. Per step of STEP widths that is STEP / MIN_RADIUS radians.
+    const stepAngle = STEP / MIN_RADIUS, a2 = stepAngle * stepAngle, cosStep = 1 - a2 / 2 + a2 * a2 / 24, sinStep = Math.sqrt(1 - cosStep * cosStep);
     const S = this.maps.silhouette, mw = this.maps.w, mh = this.maps.h;
     // Coverage layers must cover everything, so they are not held back at silhouettes.
     const guard = L.threshold > 0 ? smoothstep((L.widthMm - 2.5) / 7) : 0;
@@ -414,7 +445,12 @@ export class Planner {
         // Midpoint (RK2) step along the field, keeping the sign of travel.
         directionAt(flow, px - 0.5, py - 0.5, dx, dy, d);
         directionAt(flow, px + d[0] * h * 0.5 - 0.5, py + d[1] * h * 0.5 - 0.5, d[0], d[1], m);
-        // A stiff blade: past the turn limit the stroke carries straight on.
+        // A knife cannot turn tighter than a few blade widths without smearing: limit the turn per
+        // step to that radius, then past the total turn limit carry straight on.
+        if (m[0] * dx + m[1] * dy < cosStep) {
+          const sg = dx * m[1] - dy * m[0] < 0 ? -1 : 1;
+          m[0] = dx * cosStep - dy * sinStep * sg; m[1] = dy * cosStep + dx * sinStep * sg;
+        }
         const ref0x = sIdx ? -d0x : d0x, ref0y = sIdx ? -d0y : d0y;
         if (m[0] * ref0x + m[1] * ref0y < cosTurn) { m[0] = dx; m[1] = dy; }
         const nx = px + m[0] * h, ny = py + m[1] * h;
@@ -482,7 +518,7 @@ export class Planner {
   }
 
   /** Cells within half a width of the centreline, in increasing index order. */
-  private footprint(pts: number[], W: number): number[] {
+  private footprint(pts: number[], W: number, roundEnds = false): number[] {
     const { gw, gh } = this, r = W * 0.5, r2 = r * r;
     let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
     for (let i = 0; i < pts.length; i += 2) { x0 = Math.min(x0, pts[i]); x1 = Math.max(x1, pts[i]); y0 = Math.min(y0, pts[i + 1]); y1 = Math.max(y1, pts[i + 1]); }
@@ -498,7 +534,7 @@ export class Planner {
         const vx = bx - ax, vy = by - ay, l2 = vx * vx + vy * vy;
         let t = l2 > 0 ? ((cx - ax) * vx + (cy - ay) * vy) / l2 : 0;
         // A knife has square ends: past the first and last point the footprint stops.
-        if ((i === 0 && t < 0) || (i === last - 2 && t > 1)) continue;
+        if (!roundEnds && ((i === 0 && t < 0) || (i === last - 2 && t > 1))) continue;
         t = t < 0 ? 0 : t > 1 ? 1 : t;
         const ex = ax + vx * t - cx, ey = ay + vy * t - cy, d2 = ex * ex + ey * ey;
         if (d2 < best) best = d2;
@@ -531,28 +567,61 @@ export class Planner {
     for (const c of t.cells) { D += M.detail[c]; C += M.coherence[c]; F += M.flat[c]; R += M.relief[c]; S += M.silhouette[c]; }
     const k = t.cells.length || 1;
     D /= k; C /= k; F /= k; R /= k; S /= k;
-    const vary = 0.85 + 0.15 * h3;
+    const vary = 0.85 + 0.15 * h3, jit = (a: number) => a * (0.92 + 0.16 * h3);
+    // How much paint to pick up follows the target relief: little for quiet areas, a lot for sculptural ones.
+    const pick = 0.45 + 1.3 * R;
+    type Shape = { primitive: Primitive; gap: number; load: number; press: number; engage: number; taper: [number, number]; taperMin: number; breaks: number; heap: number; pressure: number[]; attackDeg: number; speed: number };
+    const shape = (o: Shape) => o;
     if (L.primitives === false || L.tool === 'bristle') {
-      return { primitive: 'underpaint' as Primitive, gap: 1, load: 1, press: 0, engage: 1, taper: [0, 0] as [number, number], taperMin: 0.2, breaks: 0, heap: 0.3 };
+      return shape({ primitive: 'underpaint', gap: 1, load: 1, press: 0, engage: 1, taper: [0, 0], taperMin: 0.2, breaks: 0, heap: 0.3, pressure: [1], attackDeg: 30, speed: 1 });
     }
     if (L.kind === 'contour') {
-      return { primitive: 'contour' as Primitive, gap: 0.85 + 0.35 * R, load: 0.8, press: 0, engage: 1, taper: [0.1, 0.4] as [number, number], taperMin: 0.15, breaks: 0, heap: 0.3 };
+      return shape({ primitive: 'contour', gap: 0.85 + 0.35 * R, load: 0.8 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.15, breaks: 0, heap: 0.3, pressure: [0.5, 0.95, jit(1), 0.9, 0.35], attackDeg: 25, speed: 1.1 });
     }
     if (F > 0.6) {
-      // Flat: wide, thin and pressed smooth, with soft ends and almost no heap.
-      return { primitive: 'sweep' as Primitive, gap: 0.5, load: 0.7, press: 0.06 + 0.12 * F, engage: 1, taper: [0, 0.22] as [number, number], taperMin: 0.55, breaks: 0, heap: 0.1 };
+      // Flat: a broad, light, flat-bladed sweep that feathers out; little paint, little berm.
+      return shape({ primitive: 'sweep', gap: 0.5, load: 0.6, press: 0.06 + 0.12 * F, engage: 1, taper: [0, 0], taperMin: 0.55, breaks: 0, heap: 0.1, pressure: [0.6, jit(0.75), 0.8, 0.7, 0.3], attackDeg: 12 + 6 * h4, speed: 1.5 });
     }
     if (D > 0.45 && C < 0.38) {
-      // Incoherent texture: broken, partly starved paint that catches on what is below.
-      return { primitive: 'scumble' as Primitive, gap: 0.8, load: 0.45, press: 0, engage: 0.75 * vary + 0.15, taper: [0.2, 0.3] as [number, number], taperMin: 0.25, breaks: 0.22 + 0.25 * smoothstep((D - 0.45) / 1.2), heap: 0.25 };
+      if (R > 0.62 && h4 < 0.45) {
+        // High-relief texture: press and lift, an irregular loaded deposit.
+        return shape({ primitive: 'pat', gap: 0.9, load: 1.4 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.3, breaks: 0, heap: 1, pressure: [jit(1.3), 1.15, 0.9, 0.5, 0.2], attackDeg: 45, speed: 0.6 });
+      }
+      // Low-relief texture: light, broken and partly starved, catching on what is below.
+      return shape({ primitive: 'scumble', gap: 0.8, load: 0.45, press: 0, engage: 0.75 * vary + 0.15, taper: [0, 0], taperMin: 0.25, breaks: 0.22 + 0.25 * smoothstep((D - 0.45) / 1.2), heap: 0.25, pressure: [0.45, jit(0.6), 0.55, 0.5, 0.3], attackDeg: 15, speed: 1.8 });
     }
     const accent = R > 0.6 && lightness > 0.62 && h4 < 0.35;
-    if (C > 0.5 && L.widthMm <= 6.5) {
-      // Fine coherent structure: a tapered mark.
-      return { primitive: (accent ? 'accent' : 'mark') as Primitive, gap: (0.85 + 0.4 * R) * (accent ? 1.3 : 1), load: 1, press: 0, engage: 0.7 * vary + 0.25, taper: [0.3, 0.45] as [number, number], taperMin: 0.12, breaks: 0, heap: accent ? 1.2 : 0.35 + 0.3 * S };
+    if (accent) {
+      return shape({ primitive: 'accent', gap: (0.85 + 0.4 * R) * 1.3, load: 1.6 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.5, breaks: 0, heap: 1.4, pressure: [0.9, jit(1.25), 1.35, 1.3, 1.15], attackDeg: 35, speed: 0.8 });
     }
-    // A broad plane: square ends; relief follows the area.
-    return { primitive: (accent ? 'accent' : 'plane') as Primitive, gap: (0.6 + 0.65 * R) * (accent ? 1.3 : 1), load: 1, press: 0.04 * F, engage: 0.12 * vary + 0.86, taper: [0, 0.12] as [number, number], taperMin: 0.5, breaks: 0, heap: accent ? 1.4 : 0.2 + 0.75 * R };
+    if (C > 0.5 && L.widthMm <= 6.5) {
+      // Fine coherent structure: a comma-shaped mark, narrow at both ends.
+      return shape({ primitive: 'mark', gap: 0.85 + 0.4 * R, load: pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.12, breaks: 0, heap: 0.35 + 0.3 * S, pressure: [0.15, jit(0.85 + 0.3 * R), 1 + 0.2 * R, 0.75, 0.12], attackDeg: 30 + 15 * h4, speed: 1.2 });
+    }
+    // A broad plane: square ends; pressure at the lift (and so the heap) follows the area's relief.
+    return shape({ primitive: 'plane', gap: 0.6 + 0.65 * R, load: pick, press: 0.04 * F, engage: 0.12 * vary + 0.88, taper: [0, 0], taperMin: 0.5, breaks: 0, heap: 0.2 + 0.75 * R, pressure: [0.55, 1, jit(1 + 0.25 * R), 0.95, 0.3 + 0.75 * R * R], attackDeg: 22 + 16 * h4, speed: 1 });
+  }
+
+  /**
+   * Width of the feature under each of n points along a path, as a share of the blade: how far the
+   * stroke's colour extends either side before it changes (after Im2Oil's stroke-extent search).
+   */
+  private widthRatios(pts: number[], W: number, ref: Grid, col: number[], tol: number, n: number): number[] {
+    const out: number[] = [], np = pts.length / 2, step = 0.5;
+    for (let q = 0; q < n; q++) {
+      const i = Math.min(np - 1, Math.round(q / (n - 1) * (np - 1))) * 2;
+      const j = Math.min(pts.length - 2, i + 2), k = Math.max(0, i - 2);
+      let tx = pts[j] - pts[k], ty = pts[j + 1] - pts[k + 1];
+      const tl = Math.sqrt(tx * tx + ty * ty) || 1; tx /= tl; ty /= tl;
+      let ext = 0;
+      for (const sg of [1, -1]) {
+        let r = 0;
+        while (r < W * 0.6 && diffAt(ref, pts[i] - ty * sg * (r + step), pts[i + 1] + tx * sg * (r + step), col) < tol) r += step;
+        ext += r;
+      }
+      out.push(ext / W);
+    }
+    return out;
   }
 
   /**
@@ -651,18 +720,25 @@ export class Planner {
     };
     const forward = n < 4 ? true : endScore(n - 2, n - 4) <= endScore(0, 2) + (hash(seed, index, 5) - 0.5) * 0.01;
     if (!forward) { const r: number[] = []; for (let i = n - 2; i >= 0; i -= 2) r.push(pts[i], pts[i + 1]); pts = r; }
-    const footprint = simplify(pts, 6).map(([x, y]) => [x * cell, y * cell] as Vec2);
+    const footprint = simplify(pts, turnOf(pts) > 0.5 ? 8 : 6).map(([x, y]) => [x * cell, y * cell] as Vec2);
     // The path runs past the footprint by the tail, along the last direction.
     const [ax, ay] = footprint[footprint.length - 2], [bx, by] = footprint[footprint.length - 1];
     const dl = Math.sqrt((bx - ax) * (bx - ax) + (by - ay) * (by - ay)) || 1;
     const points = footprint.slice(0, -1).concat([[bx, by], [bx + (bx - ax) / dl * s.tailMm, by + (by - ay) / dl * s.tailMm]]);
     // Re-space so Catmull-Rom has evenly spaced control points.
-    const path = simplify(points.flatMap((p) => [p[0], p[1]]), Math.min(6, points.length));
+    const path = simplify(points.flatMap((p) => [p[0], p[1]]), Math.min(footprint.length, points.length));
     const lengthMm = t.len * cell + s.tailMm;
     const lightness = t.lab[0] < 0 ? 0 : t.lab[0] > 1 ? 1 : t.lab[0];
     const nodes = L.nodes, pitch = L.widthMm / nodes;
     const h1 = hash(seed, index, 11), h2 = hash(seed, index, 12), h3 = hash(seed, index, 14), h4 = hash(seed, index, 15);
     const shape = this.choosePrimitive(t, L, lightness, h3, h4);
+    // Narrow features narrow the mark: pressure follows the measured width along the path.
+    let pressure = shape.pressure;
+    if (shape.primitive === 'mark' || shape.primitive === 'scumble') {
+      const ratios = this.widthRatios(pts, W, this.lab, t.lab, L.tolerance * 1.4, pressure.length);
+      pressure = pressure.map((p, q) => p * clamp((ratios[q] - 0.2) / 0.8, 0.3, 1.15));
+    }
+    pressure = pressure.map((p) => Math.round(p * 1000) / 1000);
     const gap = L.gapMm * (1 - s.lightBoost * 0.5 + s.lightBoost * lightness) * shape.gap;
     const minLoad = s.minLoad * shape.load;
     return {
@@ -672,8 +748,11 @@ export class Planner {
       secondaryFraction: 0.12 + 0.3 * clamp01(t.spread / (L.tolerance * 1.5)),
       volumePerNode: Math.max(pitch * gap * lengthMm * s.loadFactor, yieldVolume(L.tool, pitch, lengthMm) * minLoad) * (0.9 + 0.2 * h1),
       gapMm: gap, pressMm: shape.press, wipe: 0.9 + 0.08 * h2,
-      primitive: shape.primitive, engage: shape.engage, taper: shape.taper, taperMin: shape.taperMin, breaks: shape.breaks, heap: shape.heap,
+      primitive: shape.primitive, engage: shape.engage, taper: shape.taper, taperMin: shape.taperMin, breaks: shape.breaks,
+      heap: s.look === 'oil' ? 1 : shape.heap,
       edgeFlaws: s.look === 'oil' ? EDGE_FLAWS[shape.primitive] : 1,
+      pressure, attackDeg: Math.round(shape.attackDeg * 10) / 10, speed: shape.speed,
+      deposition: s.look === 'oil' ? 'physical' : 'locked',
       seed: (Math.floor(hash(seed, index, 13) * 2147483647) | 0) + 1,
     };
   }
@@ -682,6 +761,15 @@ export class Planner {
 interface Traced { pts: number[]; lab: number[]; alt: number[]; spread: number; len: number; cells: number[]; }
 
 const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
+/** Total turning of a polyline, as 1 - cos of the angle between its first and last segments. */
+function turnOf(pts: number[]): number {
+  const n = pts.length;
+  if (n < 6) return 0;
+  const ax = pts[2] - pts[0], ay = pts[3] - pts[1], bx = pts[n - 2] - pts[n - 4], by = pts[n - 1] - pts[n - 3];
+  const la = Math.sqrt(ax * ax + ay * ay), lb = Math.sqrt(bx * bx + by * by);
+  return la > 0 && lb > 0 ? 1 - (ax * bx + ay * by) / (la * lb) : 0;
+}
 const smoothstep = (x: number) => { const u = clamp01(x); return u * u * (3 - 2 * u); };
 function dist(a: ArrayLike<number>, i: number, b: ArrayLike<number>, j: number): number {
   const d0 = a[i] - b[j], d1 = a[i + 1] - b[j + 1], d2 = a[i + 2] - b[j + 2];

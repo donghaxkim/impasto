@@ -17,7 +17,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { readPng, writePng } from './png.ts';
 import { rasterizePlan } from './plan-raster.ts';
-import { DEFAULT_SETTINGS, planPainting, type Plan } from '../src/planner.ts';
+import { DEFAULT_SETTINGS, Planner, planPainting, type Plan } from '../src/planner.ts';
+import { contactProfile } from '../src/tool.ts';
 import { canvasColour, paintStrokes, startPainting, type Painting } from '../src/execute.ts';
 import { albedoField, DEFAULT_LIGHT, relight, type View } from '../src/relight.ts';
 import { linearToSrgb, srgbToLinear } from '../src/pigment.ts';
@@ -42,7 +43,24 @@ export const CROPS = [
   { name: 'lake', x0: 0.06, y0: 0.42, x1: 0.32, y1: 0.72 },
 ];
 
-interface State { plan: Plan; w: number; h: number; dx: number; height: Float32Array; thick: Float32Array; albedo: Float32Array; views: Record<string, Uint8Array>; }
+/** Per stroke (by plan index): paint laid, and how much went to berms and the heap, mm^3. */
+interface StrokeVolumes { [index: number]: { laid: number; berm: number; heap: number } }
+interface State { plan: Plan; w: number; h: number; dx: number; height: Float32Array; thick: Float32Array; albedo: Float32Array; views: Record<string, Uint8Array>; volumes: StrokeVolumes; ledger: number; }
+
+/** Run strokes, recording per-stroke volumes and the paint ledger (loaded minus accounted for, relative). */
+function paintRecorded(painting: Painting, strokes: Plan['strokes'], volumes: StrokeVolumes): void {
+  for (const st of strokes) {
+    const tool = painting.tools[st.tool], before = tool.loaded - tool.residual() - tool.wiped;
+    paintStrokes(painting, [st]);
+    const s = painting.stats[painting.stats.length - 1];
+    volumes[st.index] = { laid: tool.loaded - tool.residual() - tool.wiped - before, berm: s.bermVolume, heap: s.heapVolume };
+  }
+}
+function ledgerOf(p: Painting): number {
+  let loaded = 0, held = p.canvas.totalVolume() + p.canvas.lost;
+  for (const t of p.tools) { loaded += t.loaded; held += t.residual() + t.wiped; }
+  return loaded > 0 ? Math.abs(loaded - held) / loaded : 0;
+}
 
 /** Fast mode: plan without feedback, then paint each crop (plus a margin) on its own small canvas. */
 function paintCrops(): Record<string, State> {
@@ -53,7 +71,7 @@ function paintCrops(): Record<string, State> {
   const margin = 12;
   for (const c of CROPS) {
     // Crops overlap, so each gets its own full-size buffers (only its window is filled).
-    const st: State = { plan, w: pw, h: ph, dx: 0.1, height: new Float32Array(n), thick: new Float32Array(n), albedo: new Float32Array(n * 3), views: {} };
+    const st: State = { plan, w: pw, h: ph, dx: 0.1, height: new Float32Array(n), thick: new Float32Array(n), albedo: new Float32Array(n * 3), views: {}, volumes: {}, ledger: 0 };
     for (const v of VIEWS) st.views[v] = new Uint8Array(n * 3);
     states[c.name] = st;
     const ox = Math.max(0, c.x0 * plan.widthMm - margin), oy = Math.max(0, c.y0 * plan.heightMm - margin);
@@ -61,7 +79,8 @@ function paintCrops(): Record<string, State> {
     const strokes = plan.strokes.filter((s) => s.points.some(([x, y]) => x > ox - s.widthMm - s.lengthMm && x < ex + s.widthMm + s.lengthMm && y > oy - s.widthMm - s.lengthMm && y < ey + s.widthMm + s.lengthMm))
       .map((s) => ({ ...s, points: s.points.map(([x, y]) => [x - ox, y - oy] as [number, number]) }));
     const painting = startPainting({ ...plan, widthMm: ex - ox, heightMm: ey - oy }, settings.ground);
-    paintStrokes(painting, strokes);
+    paintRecorded(painting, strokes, st.volumes);
+    st.ledger = ledgerOf(painting);
     const { canvas } = painting, A = albedoField(canvas);
     const V: Record<string, Uint8ClampedArray> = {};
     for (const v of VIEWS) V[v] = relight(canvas, LIGHT, v);
@@ -90,13 +109,14 @@ function paintOrLoad(): State {
     const views: Record<string, Uint8Array> = {};
     for (const v of VIEWS) views[v] = new Uint8Array(readFileSync(`${out}state-${key}-${v}.bin`));
     console.log('using cached painting', key);
-    return { plan: m.plan, w: m.w, h: m.h, dx: m.dx, height: f32('height'), thick: f32('thick'), albedo: f32('albedo'), views };
+    return { plan: m.plan, w: m.w, h: m.h, dx: m.dx, height: f32('height'), thick: f32('thick'), albedo: f32('albedo'), views, volumes: m.volumes ?? {}, ledger: m.ledger ?? 0 };
   }
   const t0 = Date.now();
   let painting: Painting | null = null;
+  const volumes: StrokeVolumes = {};
   const plan = planPainting(img, settings, (_l, strokes, estimate, partial) => {
     painting ??= startPainting(partial, settings.ground);
-    paintStrokes(painting, strokes);
+    paintRecorded(painting, strokes, volumes);
     return canvasColour(painting.canvas, estimate.w, estimate.h);
   });
   const { canvas } = painting as unknown as Painting;
@@ -106,7 +126,8 @@ function paintOrLoad(): State {
   const albedo = albedoField(canvas);
   const views: Record<string, Uint8Array> = {};
   for (const v of VIEWS) views[v] = new Uint8Array(relight(canvas, LIGHT, v).buffer);
-  writeFileSync(meta, JSON.stringify({ plan, w: canvas.w, h: canvas.h, dx: canvas.dx }));
+  const ledger = ledgerOf(painting as unknown as Painting);
+  writeFileSync(meta, JSON.stringify({ plan, w: canvas.w, h: canvas.h, dx: canvas.dx, volumes, ledger }));
   writeFileSync(`${out}state-${key}-height.bin`, Buffer.from(height.buffer));
   writeFileSync(`${out}state-${key}-thick.bin`, Buffer.from(thick.buffer));
   writeFileSync(`${out}state-${key}-albedo.bin`, Buffer.from(albedo.buffer));
@@ -115,7 +136,7 @@ function paintOrLoad(): State {
   writePng(`${out}full-colour.png`, canvas.w, canvas.h, relight(canvas, LIGHT, 'color'));
   writeFileSync(`${out}plan.json`, JSON.stringify(plan));
   console.log('per layer', plan.counts, plan.stats.map((s) => s.primitives));
-  return { plan, w: canvas.w, h: canvas.h, dx: canvas.dx, height, thick, albedo, views };
+  return { plan, w: canvas.w, h: canvas.h, dx: canvas.dx, height, thick, albedo, views, volumes, ledger };
 }
 
 const perCrop = fast ? paintCrops() : null, full = fast ? null : paintOrLoad();
@@ -181,6 +202,9 @@ const dilate = (g: Float32Array, cw: number, ch: number, r: number) => {
 };
 const pct = (a: ArrayLike<number>, q: number) => { const s = Array.from(a).sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
 
+// The painting maps on the canvas grid, to split relief into structured and flat areas.
+const maps = new Planner(img, settings).maps;
+const mapAtCell = (m: Float64Array, x: number, y: number) => m[Math.min(maps.h - 1, Math.floor(y * dx / settings.analysisMm)) * maps.w + Math.min(maps.w - 1, Math.floor(x * dx / settings.analysisMm))];
 const report: Record<string, unknown> = {};
 for (const c of CROPS) {
   const st = perCrop ? perCrop[c.name] : full!;
@@ -233,7 +257,50 @@ for (const c of CROPS) {
   const bins = new Array(12).fill(0);
   for (const s of S) { const f = s.footprint, dxv = f[f.length - 1][0] - f[0][0], dyv = f[f.length - 1][1] - f[0][1]; let ang = Math.atan2(dyv, dxv); if (ang < 0) ang += Math.PI; bins[Math.min(11, Math.floor(ang / Math.PI * 12))]++; }
   const ent = -bins.filter((b) => b > 0).reduce((a, b) => a + (b / S.length) * Math.log(b / S.length), 0) / Math.log(12);
+  // 5. Expressiveness: turning, width variation along the stroke, variety of primitives.
+  const turnDeg = S.map((s) => { const f = s.footprint; let t = 0; for (let i = 2; i < f.length; i++) { const a = Math.atan2(f[i - 1][1] - f[i - 2][1], f[i - 1][0] - f[i - 2][0]), b = Math.atan2(f[i][1] - f[i - 1][1], f[i][0] - f[i - 1][0]); let d = Math.abs(b - a); if (d > Math.PI) d = 2 * Math.PI - d; t += d; } return t * 180 / Math.PI; });
+  const widthVar = S.map((s) => { const c = contactProfile(s, s.lengthMm, 9); const mx = Math.max(...c), mn = Math.min(...c); return mx > 0 ? (mx - mn) / mx : 0; });
+  const prim: Record<string, number> = {};
+  for (const s of S) prim[s.primitive] = (prim[s.primitive] ?? 0) + 1;
+  const primEnt = -Object.values(prim).reduce((a, k) => a + (k / S.length) * Math.log(k / S.length), 0) / Math.log(8);
+  const avg = (a: number[]) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
+  // 6. Relief hierarchy: relief in structured against flat areas; sculptural peaks.
+  const rel = new Float32Array(n);
+  let rDet = 0, nDet = 0, rFlat = 0, nFlat = 0;
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const i = y * cw + x, r = Math.abs(H[i * 3] - Hb[i * 3]);
+    rel[i] = r;
+    if (mapAtCell(maps.detail, x0 + x, y0 + y) > 0.6) { rDet += r * r; nDet++; }
+    if (mapAtCell(maps.flat, x0 + x, y0 + y) > 0.6) { rFlat += r * r; nFlat++; }
+  }
+  const medRel = pct(rel, 0.5);
+  let peaks = 0;
+  for (let i = 0; i < n; i++) if (rel[i] > 3 * medRel && rel[i] > 0.15) peaks++;
+  // 7. Physical realism: where the paint went; fine ripple (grooves) against form relief;
+  //    glints as few long sheens or many beads; steep walls.
+  const Hf = blur3(H, cw, ch, Math.round(0.3 / dx)), Hm = blur3(H, cw, ch, Math.round(2 / dx));
+  let fine = 0, form = 0, steep = 0;
+  for (let i = 0; i < n; i++) { fine += (H[i * 3] - Hf[i * 3]) ** 2; form += (Hf[i * 3] - Hm[i * 3]) ** 2; }
+  for (let y = 1; y < ch - 1; y++) for (let x = 1; x < cw - 1; x++) {
+    const gx = (H[(y * cw + x + 1) * 3] - H[(y * cw + x - 1) * 3]) / (2 * dx), gy = (H[((y + 1) * cw + x) * 3] - H[((y - 1) * cw + x) * 3]) / (2 * dx);
+    if (gx * gx + gy * gy > 1) steep++;
+  }
+  let laid = 0, berm = 0, heap = 0;
+  for (const s of S) { const v = st.volumes[s.index]; if (v) { laid += v.laid; berm += v.berm; heap += v.heap; } }
   const shade = images['8-paint'];
+  const isGlint = (i: number) => shade[i * 3] > 240 && shade[i * 3 + 1] > 235 && shade[i * 3 + 2] > 220;
+  const seen = new Uint8Array(n);
+  let comps = 0, glintPx = 0;
+  for (let i = 0; i < n; i++) {
+    if (seen[i] || !isGlint(i)) continue;
+    comps++;
+    const stack = [i]; seen[i] = 1;
+    while (stack.length) {
+      const q = stack.pop()!; glintPx++;
+      const qx = q % cw, qy = (q - qx) / cw;
+      for (const [ax, ay] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const xx = qx + ax, yy = qy + ay; if (xx >= 0 && yy >= 0 && xx < cw && yy < ch) { const j = yy * cw + xx; if (!seen[j] && isGlint(j)) { seen[j] = 1; stack.push(j); } } }
+    }
+  }
   let glint = 0, dark = 0;
   for (let i = 0; i < n; i++) { if (shade[i * 3] > 240 && shade[i * 3 + 1] > 235 && shade[i * 3 + 2] > 220) glint++; if (shade[i * 3] + shade[i * 3 + 1] + shade[i * 3 + 2] < 150) dark++; }
   report[c.name] = {
@@ -244,6 +311,20 @@ for (const c of CROPS) {
     reliefMm: { rms: +Math.sqrt(relief / n).toFixed(3), tileCv: +(tsd / tm).toFixed(3), tileP10: +pct(tileRelief, 0.1).toFixed(3), tileP90: +pct(tileRelief, 0.9).toFixed(3) },
     strokes: { count: S.length, widthsMm: [...new Set(widths.map((v) => +v.toFixed(1)))].sort((a, b) => b - a), lengthCv: +cv(lens).toFixed(3), straightness: +(straight.reduce((a, b) => a + b, 0) / S.length).toFixed(3), directionEntropy: +ent.toFixed(3) },
     shading: { glintPct: +(100 * glint / n).toFixed(2), darkPct: +(100 * dark / n).toFixed(2) },
+    expressiveness: {
+      meanTurnDeg: +avg(turnDeg).toFixed(1), curvedShare: +(turnDeg.filter((t) => t > 20).length / Math.max(1, S.length)).toFixed(3),
+      widthVariation: +avg(widthVar).toFixed(3), primitiveEntropy: +primEnt.toFixed(3), primitives: prim,
+    },
+    reliefHierarchy: {
+      structuredRms: +Math.sqrt(rDet / Math.max(1, nDet)).toFixed(3), flatRms: +Math.sqrt(rFlat / Math.max(1, nFlat)).toFixed(3),
+      ratio: nFlat && nDet ? +(Math.sqrt(rDet / nDet) / Math.max(1e-6, Math.sqrt(rFlat / nFlat))).toFixed(2) : null,
+      peakShare: +(100 * peaks / n).toFixed(2),
+    },
+    realism: {
+      bermShare: laid > 0 ? +(berm / laid).toFixed(3) : null, heapShare: laid > 0 ? +(heap / laid).toFixed(3) : null,
+      grooveIndex: +(Math.sqrt(fine / Math.max(1e-12, form))).toFixed(3), beadIndex: glintPx ? +(1000 * comps / glintPx).toFixed(1) : null,
+      steepPct: +(100 * steep / n).toFixed(2), ledger: +st.ledger.toExponential(1),
+    },
   };
 }
 writeFileSync(`${out}metrics.json`, JSON.stringify(report, null, 2));

@@ -10,6 +10,11 @@ npm run paint -- --look oil   # the same, with the new semi-gloss look
 npm run diagnose -- --fast    # three crops (mountains, spruce, lake): plan, colour, height, normals, render, metrics
 python3 tests/diag-sheet.py out/diag && python3 tests/diag-compare.py out/diag out/diag-<name>
 npm run gpu-parity            # WebGPU shader against the CPU reference, both looks (headless Chromium)
+```
+
+The diagnostic reports, per crop: colour error and silhouettes kept at the plan, painted-colour and shaded stages; **expressiveness** (mean turn per stroke, share of curved strokes, width variation along strokes, variety of primitives); **relief hierarchy** (relief in structured against flat areas, sculptural peaks); and **physical realism** (share of paint in berms and heaps, groove index of fine ripple against form relief, bead index of glints breaking into specks, steep walls, and the volume ledger).
+
+```sh
 npm test         # physics, stroke primitives, planner and determinism checks
 npm run viewer   # writes out/viewer-*.html for moving the light live in a WebGPU browser
 python3 tests/crop.py   # JPEG previews and 1:1 crops
@@ -55,12 +60,26 @@ Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan →
 - `breaks`: the blade rides up in ragged patches that vary across and along the stroke.
 - `heap`: terminal heap size (0 lifts cleanly and keeps the bead on the knife; up to 1.5).
 - `edgeFlaws`: strength of the knife's edge profile, which prints as parallel grooves.
+- `pressure`: hand pressure samples from start to end. Below 1 only part of the blade touches, so pressure also sets the mark's width: `[0.2, 1, 1, 1, 0.2]` is a comma, narrow at both ends.
+- `attackDeg`, `speed`: blade angle to the canvas (30 by default) and relative speed.
+- `deposition`: `'locked'` (default) or `'physical'`.
+
+### Physical deposition
+
+With `deposition: 'physical'`, berms and the terminal heap follow what the hand does instead of fixed rates. Volume and pigment stay conserved (the tests check the ledger to 1e-9):
+
+- Only blade in contact squeezes paint into the bead, and harder pressure squeezes faster.
+- Sideways squeeze-out, which feeds the berms, grows with pressure and as the blade lies flatter, and shrinks for a quick pass.
+- Light pressure floats the blade on the paint (a thicker film); hard pressure sinks it in and plows.
+- On a curve the bead is thrown to the outside of the turn, so the berm builds there.
+- Pressure at the lift decides how much of the bead and load drops as the heap; a light lift keeps it on the blade.
+- Load still matters most: a heavily loaded stroke builds large berms and a heap whatever the hand does.
 
 Below 24 mm (`FULL_LIFT_LENGTH`) a stroke's touch-down, lift-off, contact length and heap scale with its length, so a 3-5 mm mark lays paint instead of a blob. Longer strokes are exactly as before.
 
 ## Looks
 
-`LightSettings.look` (and `PlanSettings.look`): `'locked'` (default) is the reference look, pixel-identical to before. `'oil'` is semi-gloss: rougher coat, highlights filtered by how fast the normal turns within a pixel (Kaplanyan's geometric specular anti-aliasing) so crests carry continuous sheens instead of beads, weaker crest boost and second highlight window, gentler cavities, and a weaker knife edge profile on broad strokes. The WebGPU port takes the same parameters (`relightUniforms`); `npm run gpu-parity` checks both looks.
+`LightSettings.look` (and `PlanSettings.look`): `'locked'` (default) is the reference look, pixel-identical to before, kept for regression comparison. `'oil'` is the intended replacement and also switches the planner's strokes to physical deposition; it becomes the default only once it is consistently better across several scenes. `'oil'` is semi-gloss: rougher coat, highlights filtered by how fast the normal turns within a pixel (Kaplanyan's geometric specular anti-aliasing) so crests carry continuous sheens instead of beads, weaker crest boost and second highlight window, gentler cavities, and a weaker knife edge profile on broad strokes. The WebGPU port takes the same parameters (`relightUniforms`); `npm run gpu-parity` checks both looks.
 
 ## Stroke planner
 
@@ -73,7 +92,9 @@ Research behind it: `docs/prior-art-research.md`.
 - **Painting representation** (`structure.ts`): detail, coherence, silhouettes (strong, coherent, large-scale edges such as ridgelines, trunks and shores), flatness and a target relief map. The planner reads these, never what the subject is.
 - **Silhouette protection:** where a silhouette runs under a broad blade, each blade edge must match on its own and the tolerance tightens, so a broad stroke never straddles a ridgeline or a trunk.
 - **Contour layer:** narrow strokes along silhouettes, centred half a blade to one side so the blade's edge lies on the silhouette (cutting in). The more uniform side is painted.
-- **Primitives:** each stroke picks one from the maps under it: `sweep` (flat areas: thin, pressed, almost no heap), `plane` (square ends, relief following the area), `mark` (fine coherent structure: tapered), `scumble` (fine incoherent texture: broken and partly starved), `contour`, and `accent` (light structured areas: thick with a full heap). Relief therefore has a hierarchy: quiet water and sky, emphatic rock and lights.
+- **Stroke paths:** a seed reads the maps around it. Flat areas take broad curved sweeps on the form field, fine coherent structure takes long organic marks on the fine edge field, texture takes short strokes, and the rest stiff planes. No stroke turns tighter than 2.5 blade widths (a knife cannot), and each has a total turn limit.
+- **The hand:** each primitive sets a pressure profile, blade angle, speed and how much paint to pick up (which follows the target relief). Marks and scumbles scale their pressure by the measured width of the feature under each point, so a mark is wide where the form is wide and narrow at a tip.
+- **Primitives:** each stroke picks one from the maps under it, plus `pat` (a short, heavy press-and-lift for high-relief texture): `sweep` (flat areas: thin, pressed, almost no heap), `plane` (square ends, relief following the area), `mark` (fine coherent structure: tapered), `scumble` (fine incoherent texture: broken and partly starved), `contour`, and `accent` (light structured areas: thick with a full heap). Relief therefore has a hierarchy: quiet water and sky, emphatic rock and lights.
 - **Knife limits:** a stroke that cannot reach its layer's minimum length without crossing a colour edge is dropped instead of smearing. Narrow knives judge colour mostly by their centreline, so they can still paint a trunk thinner than the blade.
 - **Seeding:** worst error first on a grid, skipping strokes mostly over ones already placed (Paint Transformer's occlusion rule) or that would not bring the canvas closer to the image. Coverage layers add fill passes until no cell is bare.
 - **Order:** layer by layer, large to small (underpaint, block-in, masses, forms, detail, contours, accents). Inside a layer, where two strokes overlap, the one that matches the image better there is painted later, so it ends up on top; otherwise darks go before lights.

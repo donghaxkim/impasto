@@ -91,13 +91,16 @@ test('planner: the thin tree gets narrow vertical strokes in its own colour', ()
 });
 
 test('planner: a sapling thinner than any knife still gets painted in its own colour', () => {
+  // Close to the sapling's colour (30, 70, 40); a stroke that let the lake beside it in would be
+  // much bluer and lighter (the lake is 40, 170, 190), around 85 away or more.
+  const closerToTree = (c: readonly number[]) => Math.hypot(c[0] * 255 - 30, c[1] * 255 - 70, c[2] * 255 - 40) < 70;
   // 1 mm wide: narrower than the finest blade (1.44 mm here), so the stroke must trust its centreline.
   const plan = planPainting(landscape(240, 120, 2), SMALL);
   const hits = plan.strokes.filter((st) => {
     const mid = st.footprint[Math.floor(st.footprint.length / 2)];
     const a = st.footprint[0], b = st.footprint[st.footprint.length - 1];
     const vertical = Math.abs(b[1] - a[1]) > 2.5 * Math.abs(b[0] - a[0]);
-    return vertical && mid[0] > 84.5 && mid[0] < 86.5 && mid[1] > 14 && mid[1] < 52 && st.primary[1] > st.primary[2] + 0.02 && st.primary[1] < 0.45;
+    return vertical && mid[0] > 84.5 && mid[0] < 86.5 && mid[1] > 14 && mid[1] < 52 && closerToTree(st.primary);
   });
   assert.ok(hits.length >= 1, `${hits.length} sapling strokes`);
 });
@@ -133,7 +136,7 @@ test('planner: detail strokes never smear across a colour edge', () => {
 });
 
 /** Analysis cells covered by these strokes' footprints (knife-ended capsules). */
-function coverage(strokes: PlannedStroke[], w: number, h: number, cell: number): Uint8Array {
+function coverage(strokes: PlannedStroke[], w: number, h: number, cell: number, roundEnds = false): Uint8Array {
   const out = new Uint8Array(w * h);
   for (const st of strokes) {
     const r = st.widthMm / 2 / cell, pts = st.footprint.map(([x, y]) => [x / cell, y / cell]);
@@ -142,7 +145,7 @@ function coverage(strokes: PlannedStroke[], w: number, h: number, cell: number):
       for (let i = 0; i < pts.length - 1; i++) {
         const [ax, ay] = pts[i], [bx, by] = pts[i + 1], vx = bx - ax, vy = by - ay, l2 = vx * vx + vy * vy;
         let t = l2 > 0 ? ((cx - ax) * vx + (cy - ay) * vy) / l2 : 0;
-        if ((i === 0 && t < 0) || (i === pts.length - 2 && t > 1)) continue;
+        if (!roundEnds && ((i === 0 && t < 0) || (i === pts.length - 2 && t > 1))) continue;
         t = Math.max(0, Math.min(1, t));
         if (Math.hypot(ax + vx * t - cx, ay + vy * t - cy) <= r) { out[y * w + x] = 1; break; }
       }
@@ -154,7 +157,8 @@ function coverage(strokes: PlannedStroke[], w: number, h: number, cell: number):
 test('planner: the underpainting leaves no bare canvas', () => {
   const plan = planPainting(landscape(), SMALL);
   const cell = SMALL.analysisMm!, w = Math.round(plan.widthMm / cell), h = Math.round(plan.heightMm / cell);
-  const cov = coverage(plan.strokes.filter((st) => st.layer === 0), w, h, cell);
+  // The underpainting is a bristle brush, whose footprint has round ends.
+  const cov = coverage(plan.strokes.filter((st) => st.layer === 0), w, h, cell, true);
   let bare = 0;
   for (const c of cov) bare += c ^ 1;
   assert.equal(bare, 0, `${bare} bare cells`);
@@ -237,6 +241,34 @@ test('primitives: flat areas get thin quiet strokes, structured ones thicker; th
   assert.deepEqual(oil.strokes.map((st) => st.points), plan.strokes.map((st) => st.points), 'the look does not change the plan');
 });
 
+test('strokes: curved paths, varying pressure and width, and physical deposition in the oil look', () => {
+  // A smooth ring: its edge curves continuously, so marks along it should bend.
+  const w = 240, h = 120, data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const d = Math.hypot(x - 120, y - 60), v = d > 30 && d < 42 ? [40, 90, 60] : [200, 205, 190];
+    data.set(v, (y * w + x) * 3);
+  }
+  const plan = planPainting({ w, h, data }, { ...SMALL, look: 'oil' });
+  const knives = plan.strokes.filter((st) => st.primitive !== 'underpaint');
+  const turn = (st: PlannedStroke) => {
+    const f = st.footprint; let t = 0;
+    for (let i = 2; i < f.length; i++) {
+      const ax = f[i - 1][0] - f[i - 2][0], ay = f[i - 1][1] - f[i - 2][1], bx = f[i][0] - f[i - 1][0], by = f[i][1] - f[i - 1][1];
+      t += Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by) / (Math.hypot(ax, ay) * Math.hypot(bx, by) || 1))));
+    }
+    return t * 180 / Math.PI;
+  };
+  const curved = knives.filter((st) => turn(st) > 20);
+  assert.ok(curved.length > knives.length * 0.25, `${curved.length} of ${knives.length} strokes turn more than 20 degrees`);
+  // No tighter than the knife's minimum turning radius: at most about STEP/MIN_RADIUS per quarter blade.
+  for (const st of knives) assert.ok(turn(st) < 120, `stroke ${st.index} turns ${turn(st).toFixed(0)} degrees`);
+  const varied = knives.filter((st) => Math.max(...st.pressure) - Math.min(...st.pressure) > 0.4);
+  assert.ok(varied.length > knives.length * 0.5, `${varied.length} of ${knives.length} strokes vary in pressure`);
+  for (const st of knives) { assert.equal(st.deposition, 'physical'); assert.equal(st.heap, 1); }
+  const locked = planPainting({ w, h, data }, SMALL);
+  for (const st of locked.strokes) assert.equal(st.deposition, 'locked');
+});
+
 test('direction field follows a straight edge and falls back to horizontal on flat colour', () => {
   // A diagonal edge at about 30 degrees from horizontal, then flat colour.
   const w = 120, h = 80, data = new Uint8Array(w * h * 3);
@@ -286,9 +318,11 @@ test('a plan paints through the simulation deterministically and conserves paint
 });
 
 test('planner and analysis code avoid engine-dependent math', () => {
-  for (const f of ['planner.ts', 'image.ts', 'execute.ts', 'tool.ts', 'canvas.ts', 'relight.ts', 'pigment.ts']) {
+  for (const f of ['planner.ts', 'image.ts', 'structure.ts', 'execute.ts', 'tool.ts', 'canvas.ts', 'relight.ts', 'pigment.ts', 'dmath.ts']) {
     const src = readFileSync(new URL(`../src/${f}`, import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     const bad = src.match(/Math\.(sin|cos|tan|atan2?|asin|acos|pow|exp|log\w*|cbrt|random|hypot|tanh)\b/g);
     assert.equal(bad, null, `${f} uses ${bad}`);
+    // The exponent operator has Math.pow's engine-dependent rounding too.
+    assert.equal(src.match(/[\w)\]]\s*\*\*\s*[\w(]/g), null, `${f} uses **`);
   }
 });

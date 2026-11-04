@@ -37,6 +37,52 @@ export interface StrokeSpec {
   heap?: number;
   /** Strength of the knife's edge profile and nicks, which print as grooves along the stroke (0-1, default 1). */
   edgeFlaws?: number;
+  /**
+   * Hand pressure along the stroke, as samples spread evenly from start to end (linear between;
+   * default [1]). Below 1 only part of the blade touches, so pressure also sets the mark's width
+   * (a light touch is narrow, as with a flexing knife tip). With `deposition: 'physical'` it also
+   * sets how deep the blade sits, how much paint squeezes out into berms and how much is shed at
+   * the lift.
+   */
+  pressure?: readonly number[];
+  /** Blade angle to the canvas, degrees (default 30). Flatter squeezes more paint sideways into berms. */
+  attackDeg?: number;
+  /** Relative speed (default 1). A fast pass leaves less time for paint to squeeze out sideways. */
+  speed?: number;
+  /**
+   * 'locked' (default): the reference deposition. 'physical': berms and the terminal heap follow
+   * pressure, attack angle, speed and the path's curvature (paint is thrown to the outside of a
+   * turn). Volume and pigment are conserved either way.
+   */
+  deposition?: 'locked' | 'physical';
+}
+
+/** Pressure at a fraction t (0-1) of the stroke, from a sample profile. */
+export function pressureAt(profile: readonly number[] | undefined, t: number): number {
+  if (!profile || profile.length === 0) return 1;
+  if (profile.length === 1) return profile[0];
+  const x = clamp(t, 0, 1) * (profile.length - 1), i = Math.floor(x), f = x - i;
+  return i >= profile.length - 1 ? profile[profile.length - 1] : profile[i] + (profile[i + 1] - profile[i]) * f;
+}
+/** Share of the (engaged) blade in contact at a given pressure: a light touch lands only part of the edge. */
+export const contactFromPressure = (p: number) => (p >= 1 ? 1 : p <= 0 ? 0.2 : 0.2 + 0.8 * p);
+
+/**
+ * Contact width along a stroke as a share of the tool width, at n points from start to end:
+ * engagement, tapers and pressure together (edge wobble aside). The simulation uses the same rule.
+ */
+export function contactProfile(stroke: StrokeSpec, lengthMm: number, n: number): number[] {
+  const engage = clamp(stroke.engage ?? 1, 0.05, 1), th = stroke.taper?.[0] ?? 0, tt = stroke.taper?.[1] ?? 0, tm = clamp(stroke.taperMin ?? 0.2, 0.02, 1);
+  const out: number[] = [];
+  for (let k = 0; k < n; k++) {
+    const t = n === 1 ? 0.5 : k / (n - 1), s = t * lengthMm;
+    let c = engage;
+    if (th > 0 && s < th * lengthMm) c *= tm + (1 - tm) * smooth(s / (th * lengthMm));
+    if (tt > 0 && s > lengthMm - tt * lengthMm) c *= tm + (1 - tm) * smooth((lengthMm - s) / (tt * lengthMm));
+    if (stroke.pressure) c *= contactFromPressure(pressureAt(stroke.pressure, t));
+    out.push(c);
+  }
+  return out;
 }
 
 /**
@@ -229,6 +275,14 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
   const volThreshold = yieldVolume(tool.spec.kind, pitch, L);
   const heapScale = clamp(stroke.heap ?? 1, 0, 1.5);
   const squeezeShare = knife ? 0.17 : 0.06;
+  // Physical deposition: how much paint a blade squeezes sideways grows as it lies flatter
+  // (attack 30 degrees is the reference) and shrinks for a quick pass.
+  const physical = stroke.deposition === 'physical';
+  const attackF = physical ? clamp((90 - (stroke.attackDeg ?? 30)) / 60, 0.25, 1.4) : 1;
+  const speedF = physical ? 1 / Math.sqrt(clamp(stroke.speed ?? 1, 0.25, 4)) : 1;
+  const profile = stroke.pressure;
+  // Pressure at the lift decides how much of the bead and load drops as the terminal heap.
+  const liftP = physical ? clamp(pressureAt(profile, 1), 0, 1.5) : 1;
   const press = stroke.pressMm ?? 0;
   const ringR = Math.max(2, Math.round(0.45 / dx));
 
@@ -265,8 +319,11 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
     // Each edge of the tool wanders, so the silhouette is never a clean ribbon.
     const wobL = (fbm1(s * 0.16, seed, 41) - 0.5) * (knife ? 0.09 : 0.14) + (noise1(s * 1.1, seed, 42) - 0.5) * 0.025;
     const wobR = (fbm1(s * 0.16, seed, 43) - 0.5) * (knife ? 0.09 : 0.14) + (noise1(s * 1.1, seed, 44) - 0.5) * 0.025;
+    // Hand pressure here. A light touch lands only part of the blade.
+    const pr = profile ? pressureAt(profile, s / L) : 1;
     // Contact width: the engaged share of the blade, narrowed further toward tapered ends.
     let contact = engage;
+    if (profile) contact *= contactFromPressure(pr);
     if (taperHead > 0 && s < taperHead * L) contact *= taperMin + (1 - taperMin) * smooth(s / (taperHead * L));
     if (taperTail > 0 && s > L - taperTail * L) contact *= taperMin + (1 - taperMin) * smooth((L - s) / (taperTail * L));
     const off = contact < 1 ? Math.floor((1 - contact) * 0.5 * N) : 0;
@@ -298,7 +355,9 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
     const stickSlip = noise1(s * 0.14, seed, 48);
     const chatterBase = knife ? (noise1(s * 0.9, seed, 46) - 0.5) * (0.03 + 0.16 * stickSlip * stickSlip) + (noise1(s * 3.3, seed, 47) - 0.5) * 0.02 : 0;
     const roll = (noise1(s * 0.055, seed, 49) - 0.5) * 1.5 + (hash(seed, 7, 92) - 0.5) * 0.6;
-    const gap = Math.max(0.04, stroke.gapMm * load * (1 + 0.9 * liftT * liftT));
+    // Physical: light pressure floats the blade on the paint (thicker film); hard pressure sinks it in.
+    const gap = Math.max(0.04, stroke.gapMm * load * (1 + 0.9 * liftT * liftT) * (physical && pr < 1 ? 1 + 0.6 * (1 - pr) : 1));
+    const pressNow = physical && pr > 1 ? press + (pr - 1) * 0.35 : press;
 
     if (step === 0) z.fill(0);
     zPrev.set(z);
@@ -319,7 +378,7 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
       const nickGate = smooth((noise2(i * 0.045, s * 0.07, seed + 9) - 0.34) / 0.3);
       // Pressure compacts wet paint: over a thick bed the tool sinks in and plows it.
       const bed = lerp(support, blur[i], flex);
-      const local = bed - Math.max(0, bed - 2.2) * (knife ? 0.55 : 0.4) - press;
+      const local = bed - Math.max(0, bed - 2.2) * (knife ? 0.55 : 0.4) - pressNow;
       const wander = knife ? 0 : (noise2(i * 0.31, s * 0.09, seed) - 0.5) * 0.34;
       // The knife's edge profile (its fixed waviness and nicks) prints along the whole stroke as
       // parallel grooves; edgeFlaws scales it. The blade's gentle camber stays.
@@ -441,7 +500,7 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
           v[i] -= vol;
           // squeezedLoad: pressing paint under the edge forces a share of it out sideways.
           if (v[i] > 0) {
-            const out = Math.min(v[i], vol * squeezeShare), share = out / v[i];
+            const out = Math.min(v[i], vol * (physical ? squeezeShare * (pr < 1.5 ? pr : 1.5) * attackF * speedF : squeezeShare)), share = out / v[i];
             v[i] -= out; wv[i] += out;
             for (let k = 0; k < 3; k++) { const m = p[ni + k] * share; p[ni + k] -= m; wp[ni + k] += m; }
           }
@@ -495,11 +554,13 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
     const pressureCap = tool.capacity * (0.65 + 0.35 * clamp(stroke.gapMm / 1.2, 0, 1.6));
     for (let i = 0; i < N; i++) {
       const excess = v[i] - pressureCap;
-      if (excess > 0) {
-        const vol = excess * squeezeRate, frac = vol / v[i];
+      // Physical: only blade in contact squeezes, and harder pressure squeezes faster.
+      const squeezeHere = !physical ? squeezeRate : i < iL || i > iR ? 0 : squeezeRate * (pr < 1.5 ? pr : 1.5);
+      if (excess > 0 && squeezeHere > 0) {
+        const vol = excess * squeezeHere, frac = vol / v[i];
         v[i] -= vol; wv[i] += vol;
         for (let k = 0; k < 3; k++) { const m = p[i * 3 + k] * frac; p[i * 3 + k] -= m; wp[i * 3 + k] += m; }
-      } else if (wv[i] > 0) {
+      } else if (excess <= 0 && wv[i] > 0) {
         // A starving node draws a little back from the bead in front of it.
         const vol = Math.min(wv[i] * 0.01, -excess), frac = wv[i] > 0 ? vol / wv[i] : 0;
         wv[i] -= vol; v[i] += vol;
@@ -517,10 +578,22 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
       }
     }
 
-    // Wave moves outward along the edge. It leaves only through the two sides.
-    const split = Math.floor(N * sideBias);
-    for (let i = iL; i < split; i++) moveWave(tool, i, i === iL ? -1 : i - 1, 0, lateral);
-    for (let i = iR; i >= split; i--) moveWave(tool, i, i === iR ? -2 : i + 1, 1, lateral);
+    // Wave moves outward along the edge. It leaves only through the two sides. Physical: on a
+    // curve the bead is thrown to the outside of the turn, and pressure drives it outward faster.
+    let bias = sideBias, lat = lateral;
+    if (physical) {
+      const ax = xs[step] - xs[j0], ay = ys[step] - ys[j0], bx = xs[j1] - xs[step], by = ys[j1] - ys[step];
+      const la = Math.sqrt(ax * ax + ay * ay), lb = Math.sqrt(bx * bx + by * by);
+      if (la > 1e-9 && lb > 1e-9) {
+        // Turn toward +n (the side-1 direction) per mm; the outside of that turn is side 0.
+        const turn = ((bx / lb - ax / la) * nx + (by / lb - ay / la) * ny) / ((la + lb) * 0.5);
+        bias = clamp(sideBias + turn * W * 1.5, 0.1, 0.9);
+      }
+      lat = lateral * (0.5 + 0.5 * (pr < 1.5 ? pr : 1.5));
+    }
+    const split = Math.floor(N * bias);
+    for (let i = iL; i < split; i++) moveWave(tool, i, i === iL ? -1 : i - 1, 0, lat);
+    for (let i = iR; i >= split; i--) moveWave(tool, i, i === iR ? -2 : i + 1, 1, lat);
     for (let i = 0; i < iL; i++) moveWave(tool, i, -1, 0, 1);
     for (let i = N - 1; i > iR; i--) moveWave(tool, i, -2, 1, 1);
 
@@ -540,7 +613,7 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
     // Side berms: the edge stores release irregular chunks just outside the footprint.
     // A berm can only be so large in cross-section; the rest rides on to the terminal heap.
     for (let side = 0; side < 2; side++) {
-      allowance[side] = Math.min(allowance[side] + ds * (knife ? 1.5 : 0.8) * (0.2 + 1.6 * fbm1(s * 0.3, seed, 57 + side)), 0.6);
+      allowance[side] = Math.min(allowance[side] + ds * (knife ? 1.5 : 0.8) * (0.2 + 1.6 * fbm1(s * 0.3, seed, 57 + side)) * (physical ? (pr < 1.5 ? pr : 1.5) : 1), 0.6);
       sinceEmit[side] += ds;
       const ev = Math.min(tool.edgeV[side], allowance[side]);
       const chunk = (knife ? 0.004 : 0.003) * (1 + 3 * noise1(s * 2.3, seed, 51 + side));
@@ -584,14 +657,16 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
       dumped[i] = 1;
       if (i < iL - 1 || i > iR + 1) continue;
       // A clean lift keeps part of the bead on the knife instead of dropping it.
-      const keep = heapScale < 1 ? 1 - heapScale : 0;
+      // Physically, a light lift keeps more of the bead on the blade than a hard one.
+      const dropShare = heapScale * (physical ? clamp(0.25 + 0.75 * liftP, 0, 1) : 1);
+      const keep = dropShare < 1 ? 1 - dropShare : 0;
       if (keep > 0 && wv[i] > 0) {
         const kv = wv[i] * keep;
         for (let k = 0; k < 3; k++) { const m = wp[i * 3 + k] * keep; wp[i * 3 + k] -= m; p[i * 3 + k] += m; }
         wv[i] -= kv; v[i] += kv;
       }
       // A short mark sheds in proportion to its length; `heap` scales it further.
-      const shed = v[i] > volThreshold ? Math.min(0.9, (knife ? 0.42 : 0.16) * (0.6 + 0.8 * hash(i, seed, 61)) * lift * heapScale) : 0;
+      const shed = v[i] > volThreshold ? Math.min(0.9, (knife ? 0.42 : 0.16) * (0.6 + 0.8 * hash(i, seed, 61)) * lift * heapScale * liftP) : 0;
       const fromLoad = Math.min(v[i] * shed, shedCap * lift * (heapScale > 1 ? heapScale : 1));
       const frac = v[i] > 0 ? fromLoad / v[i] : 0;
       const vol = wv[i] + fromLoad;
