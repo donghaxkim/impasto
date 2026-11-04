@@ -1,0 +1,12 @@
+{
+  // npm run build: JavaScript and declarations for the package entries, into dist/.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}

@@ -23,6 +23,61 @@ npm run viewer   # writes out/viewer-*.html for moving the light live in a WebGP
 python3 tests/crop.py   # JPEG previews and 1:1 crops
 ```
 
+## Library API
+
+`src/index.ts` (package `impasto-sim`) wraps the same pipeline as `npm run paint` (`src/pipeline.ts`) in a promise. It runs in browsers, workers and Node and imports no Node or DOM modules.
+
+```ts
+import { renderImpasto, ImpastoError } from 'impasto-sim';
+
+const result = await renderImpasto(file, {        // ImageData, { width, height, data } RGB/RGBA bytes,
+  preset: 'oil',                                  // or in a browser a Blob/File, ImageBitmap, <img>, <canvas>
+  widthMm: 240,                                   // canvas width; detail and time both grow with it
+  seed: 1,
+  light: { azimuth: 225, elevation: 30 },
+  onProgress: ({ stage, layer, layers, fraction }) => bar.value = fraction,
+  signal: controller.signal,                      // checked between layers; rejects with an AbortError
+});
+ctx.putImageData(new ImageData(result.image.data, result.image.width), 0, 0); // RGBA, lit on the CPU
+viewer.load(result.surface);                      // ImpastoSurface: height and colour buffers for live relighting
+```
+
+- **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes`, and `timings` in ms.
+- **Presets** (`src/presets.ts`), each a few overrides on `DEFAULT_SETTINGS` and `DEFAULT_LIGHT`, so planner defaults flow through:
+  - `'oil'` (default): the planner's `oil` look with all its defaults, semi-gloss renderer.
+  - `'locked'`: the round-3 reference look, identical to `npm run paint -- --look locked` (a test pins it).
+  - `'smooth'`: `oil` with more restraint, single-colour (unstreaked) loads, thinner knife paint, lights laid less thick, fewer detail and accent marks, slightly less saturation, a higher lamp, shallower shadows, less shading relief and glow.
+- `options.advanced` takes raw `PlanSettings` over the preset. It is unstable: names and meanings change without notice.
+- **Size and time:** the canvas is simulated at 0.1 mm, so time and memory grow with its area: the 1440 x 692 lake photo at the default 240 mm width (240 x 115 mm, 1487 strokes) took 1 min 45 s of CPU (4 min wall on a busy 2-core machine) and 0.8 GB peak; 360 x 240 mm is about three times the area. `widthMm` is clamped to 20 mm and to a longest side of 480 mm (`canvasWidthMm` gives the width that will be used). Images up to 50 megapixels and 8:1 are accepted; pixels beyond the canvas's 0.5 mm analysis grid add nothing, so downscale large photos first.
+- **Errors:** bad input rejects with `ImpastoError` and a `code`: `UNSUPPORTED_SOURCE`, `EMPTY_IMAGE`, `BAD_DATA`, `BAD_ASPECT`, `IMAGE_TOO_LARGE`, `DECODE_FAILED`, `BAD_OPTION`. Alpha is composited over white.
+- `planImpasto(image, options)` returns just the stroke plan in seconds (planned without the simulation, so it differs from what `renderImpasto` paints).
+- **Off the main thread:** between layers the render yields to the event loop, but each layer is seconds to a minute of synchronous work, so on a page use the worker:
+
+  ```ts
+  import ImpastoWorker from 'impasto-sim/worker?worker';   // Vite syntax
+  import { renderInWorker } from 'impasto-sim';
+  const worker = new ImpastoWorker();
+  const result = await renderInWorker(worker, file, { preset: 'oil', onProgress, signal });
+  ```
+
+  Same options and result; progress and abort are forwarded and the result buffers are transferred. `<img>` and canvas sources are read on the page first; Blobs and ImageBitmaps are decoded in the worker.
+
+### Using it from the website
+
+With the website and this repo side by side (`website/`, `impasto/`):
+
+1. Once, in `impasto/sim`: `npm install`. That installs TypeScript and builds `dist/` (the `prepare` script).
+2. In the website's `package.json`: `"impasto-sim": "file:../impasto/sim"`, then `npm install`. npm (10.x, checked) links the folder (a symlink, so `files` does not apply) and runs its `prepare` script on every `npm install` in the website, even when everything is up to date, which rebuilds `dist/` (about 10 s). It does not install `impasto/sim`'s devDependencies, so TypeScript comes from step 1; if that was skipped and there is no `dist/` yet, the install stops with a message saying to run it.
+3. After changing the simulation, run `npm run build` in `impasto/sim` (or `npm install` in the website); a running Vite dev server does not rebuild it. Or, for development, let Vite read the TypeScript sources directly through the package's `source` export condition (no build step, and edits hot-reload):
+
+   ```ts
+   // website/vite.config.ts
+   import { defineConfig, defaultClientConditions } from 'vite';
+   export default defineConfig({ resolve: { conditions: ['source', ...defaultClientConditions] } });
+   ```
+
+Types ship as `.d.ts` in `dist/` and need TypeScript 5.7 or newer (`Uint8ClampedArray<ArrayBuffer>`). `npm run typecheck` checks the library sources; `npm run test:api` runs the API tests alone.
+
 ## How it works
 
 Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan → `execute.ts` runs it through `tool.ts`/`canvas.ts` → `relight.ts`.

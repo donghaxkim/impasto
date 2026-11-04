@@ -1,0 +1,21 @@
+{
+  // Type-checks the library sources reachable from its entries (npm run typecheck). The tests and
+  // tools run directly under node --experimental-strip-types and are not part of it.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    // DOM for performance, setTimeout, AbortSignal, DOMException; Node has the same globals.
+    "lib": ["ES2022", "DOM"],
+    "types": [],
+    "strict": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    // Sources import each other with .ts extensions (so Node can run them as they are);
+    // the build rewrites them to .js.
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "noEmit": true
+  },
+  "files": ["src/index.ts", "src/worker.ts"]
+}
