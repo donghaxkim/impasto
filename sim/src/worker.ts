@@ -16,7 +16,7 @@
  * `layers: true`, 'layer') messages in order, then one 'result' or 'error'. 'layer' and
  * `layers` were added later: an older worker ignores `layers` and an older page ignores 'layer'.
  */
-import { planImpasto, renderImpasto, type ImpastoImageSource, type ImpastoOptions, type ImpastoPlanResult, type ImpastoResult, type LayerSnapshot, type ProgressInfo } from './index.ts';
+import { planImpasto, renderImpasto, type ImpastoImageSource, type ImpastoOptions, type ImpastoPlanResult, type ImpastoResult, type ImpastoResultNoImage, type LayerSnapshot, type ProgressInfo } from './index.ts';
 
 /** Options that can cross to a worker (functions and signals cannot; renderInWorker forwards them). */
 export type WorkerImpastoOptions = Omit<ImpastoOptions, 'signal' | 'onProgress' | 'onLayer'>;
@@ -30,7 +30,7 @@ export type WorkerResponse =
   | { type: 'progress'; id: number; info: ProgressInfo }
   /** The snapshot's surface.height and surface.color buffers are transferred. */
   | { type: 'layer'; id: number; snapshot: LayerSnapshot }
-  | { type: 'result'; id: number; result: ImpastoResult | ImpastoPlanResult }
+  | { type: 'result'; id: number; result: ImpastoResult | ImpastoResultNoImage | ImpastoPlanResult }
   | { type: 'error'; id: number; error: { name: string; message: string; code?: string } };
 
 /** The part of Worker / MessagePort / a worker's global scope used here. */
@@ -57,9 +57,11 @@ export function serveImpasto(port: MessagePortLike): void {
     if (req.type === 'render' && req.layers === true) {
       options.onLayer = (snapshot) => port.postMessage({ type: 'layer', id: req.id, snapshot } satisfies WorkerResponse, [snapshot.surface.height.buffer, snapshot.surface.color.buffer]);
     }
-    const job: Promise<ImpastoResult | ImpastoPlanResult> = req.type === 'render' ? renderImpasto(req.image, options) : planImpasto(req.image, options);
+    const job: Promise<ImpastoResult | ImpastoResultNoImage | ImpastoPlanResult> = req.type === 'render' ? renderImpasto(req.image, options) : planImpasto(req.image, options);
     job.then((result) => {
-      const transfer = 'image' in result ? [result.image.data.buffer, result.surface.height.buffer, result.surface.color.buffer] as ArrayBuffer[] : [];
+      // A render's buffers are transferred (the image's too, unless options.image was 'none').
+      const transfer: ArrayBufferLike[] = 'surface' in result ? [result.surface.height.buffer, result.surface.color.buffer] : [];
+      if ('image' in result && result.image) transfer.unshift(result.image.data.buffer);
       port.postMessage({ type: 'result', id: req.id, result } satisfies WorkerResponse, transfer);
     }, (err: unknown) => {
       const x = err as { name?: unknown; message?: unknown; code?: unknown };

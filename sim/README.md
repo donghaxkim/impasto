@@ -52,6 +52,7 @@ attachPointerLight(viewer);
 `impasto-sim/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `impasto-sim`) save and load a result's `surface` as an `.impasto` file (quantised version 2, about 6 bytes per cell; `{ version: 1 }` for lossless floats, see `.impasto` files). The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
 
 - **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes` (the count), `strokeList` (every stroke as plain data, below), `layerNames`, and `timings` in ms (`analyse`, `plan`, `paint`, `snapshot`, `relight`, `surface`, `total`).
+- **No CPU image:** `image: 'none'` skips the CPU relight (the slowest step after painting: about 1 s per million cells on a quiet core, 10% of a render) and returns `image: null`; everything else (`surface`, `strokeList`, `light`, progress ending at `done` / 1) is the same, and `timings.relight` is 0. For a page that relights live with `createImpastoViewer` and only wants the static picture as a fallback or download, which it can make later with `relightSurface(result.surface, result.light)` (float32 heights, so within rounding of the CPU image). The default is `'full'`. The type follows the option: `renderImpasto(file, { image: 'none' })` resolves to `ImpastoResultNoImage` (`image: null`); with an `image` value only known at run time it resolves to the union. `renderInWorker` takes and types it the same way.
 - **Stroke list:** `result.strokeList` is `ImpastoStroke[]` in paint order, plain JSON (`JSON.stringify(result.strokeList)` is a downloadable stroke list). `strokesToJSON(plan)` converts a `planImpasto` plan the same way. Each stroke, in mm from the canvas's top-left corner (x right, y down), points rounded to 0.001 mm and colours and samples to 1e-4:
 
   ```ts
@@ -141,6 +142,8 @@ Types ship as `.d.ts` in `dist/` and need TypeScript 5.7 or newer (`Uint8Clamped
 ## How it works
 
 Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan → `execute.ts` runs it through `tool.ts`/`canvas.ts` → `relight.ts`.
+
+Everything after the simulation is byte-for-byte reproducible, and the optimisations in these stages keep it so (`tests/api.test.ts` and `tests/planner.test.ts` pin image and plan digests): work is skipped only where its result is provably unchanged (a shadow sample whose block maximum cannot reach the ray, a clamp that cannot bind, a micro-facet jitter of zero), sums are reordered only across independent columns, and the planner caches whole-grid analysis (the image blurred to each layer's scale in OKLab, the flow fields) rather than recomputing it per layer.
 
 - `src/image.ts`: resamples the photo onto a millimetre grid, OKLab colour, blurs, and an edge-following direction field from the colour structure tensor (no angles, so no trig).
 - `src/structure.ts`: the painting representation: detail, coherence, silhouettes, flatness and target relief maps.
@@ -370,5 +373,7 @@ npm run bench -- --scenes lake,portrait,flowers,building --width 0.33x,0.67x,1x 
 ```
 
 This paints each scene at a third, two thirds and all of its default width (about 0.7, 2.7 and 6 Mc each, as the defaults are all near 6 Mc), so each scene gets a three-point scaling fit. The GPU timing at full size takes about 2-3 min per scene on SwiftShader; drop `--gpu` to save it. Peak RSS at 6 Mc is about 2 GB, plus Chromium with `--gpu`.
+
+Where the time goes (lake, `oil`, 120 mm, 0.69 Mc, 474 strokes, profiled on a shared 2-core machine): the simulation (`paintStroke`: node sweeps, wet contact, plowing, the noise functions) about 70%, the CPU relight about 12% before the shadow-march and clamp skips halved it (now 6-7%; `image: 'none'` removes it), planning 6% (of which OKLab conversion was a third before `cbrtFast`, the same bits as `dcbrt` in a tenth of the iterations), analysis 1%, and GC 5-8% (mostly the per-stroke buffers of the simulation). Per-layer `onLayer` snapshots cost 65-100 ms each at 0.69 Mc (the full-size shadow-height filter and albedo, then the box reduction).
 
 Calibration taken while three other jobs shared the machine (load average 4-9 on 2 cores, so roughly 2.5-3x slower than a quiet machine; not results): lake, `oil`, 120 mm (0.69 Mc, 487 strokes) 75 s in total, of which painting 57 s and CPU relight 10 s; 240 mm (2.77 Mc, 1487 strokes) 4.1 min, painting 3.0 min (122 ms per stroke), planning 19 s, setup 3.9 s, CPU relight 37 s, peak RSS 826 MB. Painting scaled with canvas cells to the power 0.84 and relight 0.94. The WebGPU shader on SwiftShader took 33 s per frame at 2.77 Mc. A light change on the CPU costs about 13 s per canvas Mc under that load, so live relighting needs the GPU path; the CPU renderer suits stills.

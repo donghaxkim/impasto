@@ -429,6 +429,32 @@ export class Planner {
   }
   private readonly shadeCache = new Map<number, Grid>();
   /**
+   * Whole-grid analysis that layers share, computed once: the image blurred to a layer's scale in
+   * OKLab (keyed by the blur sigma in cells), the lightly blurred OKLab image the flow fields read,
+   * and those fields (keyed by sigma and flat bias). All are read-only to the planner, so the same
+   * inputs give the same grids whether cached or not.
+   */
+  private readonly labRefCache = new Map<number, Grid>();
+  private baseCache: Grid | null = null;
+  private readonly flowCache = new Map<string, Grid>();
+  /** toOklab(gaussBlur(this.lin, sigma)), shared between layers. */
+  private labRef(sigma: number): Grid {
+    let g = this.labRefCache.get(sigma);
+    if (!g) { g = toOklab(gaussBlur(this.lin, sigma)); this.labRefCache.set(sigma, g); }
+    return g;
+  }
+  /** gaussBlur(this.lab, 0.6): the OKLab image the flow fields are built from. */
+  private base(): Grid {
+    return (this.baseCache ??= gaussBlur(this.lab, 0.6));
+  }
+  /** directionField(this.base(), sigma, this.s.flatDirection, flatBias), shared between layers. */
+  private flowField(sigma: number, flatBias: number): Grid {
+    const key = `${sigma}|${flatBias}`;
+    let g = this.flowCache.get(key);
+    if (!g) { g = directionField(this.base(), sigma, this.s.flatDirection, flatBias); this.flowCache.set(key, g); }
+    return g;
+  }
+  /**
    * Per cell, after the press layer: how firmly a press holds it (0-1): the press's match to the
    * image there times how far inside the press the cell lies. Read by pressRestraint.
    */
@@ -475,14 +501,11 @@ export class Planner {
     if (this.s.layers[l].kind === 'press') return this.planPresses(l);
     const L = this.s.layers[l], { gw, gh, cell } = this, n = gw * gh, seed = this.s.seed;
     const W = L.widthMm / cell; // tool width in cells
-    const ref = toOklab(gaussBlur(this.lin, L.blur * W));
-    this.profRef = this.s.look === 'oil' && this.s.streaks ? toOklab(gaussBlur(this.lin, Math.max(0.6, 0.12 * W))) : null;
-    const base = gaussBlur(this.lab, 0.6);
-    const flow = mergeFields(
-      directionField(base, L.flowBlur * W, this.s.flatDirection, this.s.flatBias),
-      directionField(base, L.flowBlur * W * 3, this.s.flatDirection, this.s.flatBias), this.s.formWeight);
+    const ref = this.labRef(L.blur * W);
+    this.profRef = this.s.look === 'oil' && this.s.streaks ? this.labRef(Math.max(0.6, 0.12 * W)) : null;
+    const flow = mergeFields(this.flowField(L.flowBlur * W, this.s.flatBias), this.flowField(L.flowBlur * W * 3, this.s.flatBias), this.s.formWeight);
     // Marks and contours follow the fine edge field (organic contours); planes and sweeps the merged one.
-    const fineFlow0 = directionField(base, Math.max(1.5, L.flowBlur * W * 0.6), this.s.flatDirection, this.s.flatBias * 0.5);
+    const fineFlow0 = this.flowField(Math.max(1.5, L.flowBlur * W * 0.6), this.s.flatBias * 0.5);
     // Inside a form, strokes also follow the form itself: its axis where it is elongated, its contour
     // near its boundary, image edges where they are clear.
     const level = L.formLevel !== undefined && L.formLevel >= 0 && L.threshold > 0 && this.forms.levels.length ? this.forms.levels[Math.min(L.formLevel, this.forms.levels.length - 1)] : null;
@@ -696,15 +719,12 @@ export class Planner {
     const st: LayerStats = { seeds: 0, tooShort: 0, overlapping: 0, noGain: 0, accepted: 0, primitives: {} };
     const accepted: Traced[] = [];
     const W0 = sizes[0] / cell;
-    const ref = toOklab(gaussBlur(this.lin, L.blur * W0));
+    const ref = this.labRef(L.blur * W0);
     if (!this.forms.levels.length) return this.emit(l, accepted, ref, W0, st);
     const level = this.forms.levels[Math.min(L.formLevel ?? 2, this.forms.levels.length - 1)];
-    this.profRef = this.s.streaks ? toOklab(gaussBlur(this.lin, Math.max(0.6, 0.12 * W0))) : null;
-    const base = gaussBlur(this.lab, 0.6);
+    this.profRef = this.s.streaks ? this.labRef(Math.max(0.6, 0.12 * W0)) : null;
     const shade = this.shadeAt(W0 * 2);
-    const flow = formFlow(mergeFields(
-      directionField(base, L.flowBlur * W0 * 2, this.s.flatDirection, this.s.flatBias),
-      directionField(base, L.flowBlur * W0 * 6, this.s.flatDirection, this.s.flatBias), this.s.formWeight), level, W0 * 2, 0.6, shade, this.s.shading);
+    const flow = formFlow(mergeFields(this.flowField(L.flowBlur * W0 * 2, this.s.flatBias), this.flowField(L.flowBlur * W0 * 6, this.s.flatBias), this.s.formWeight), level, W0 * 2, 0.6, shade, this.s.shading);
     // Nothing is freed for presses: a press never covers a thin shape (a mullion, a stem), however narrow.
     let region = regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W0 * W0, 0);
     // On smooth forms turning in the light, each shape is split into value bands: one press per band.
@@ -716,7 +736,7 @@ export class Planner {
     }
     // On those smooth forms a knife judges its fit against the image at its own scale (a plane
     // ignores skin texture finer than itself), so wider knives can take a band.
-    const planeRef = turns ? sizes.map((sz) => toOklab(gaussBlur(this.lin, L.blur * sz / cell))) : null;
+    const planeRef = turns ? sizes.map((sz) => this.labRef(L.blur * sz / cell)) : null;
     const cur = toOklab(this.current), err = new Float64Array(n);
     for (let i = 0; i < n; i++) err[i] = dist(ref.data, i * 3, cur.data, i * 3);
     const members = new Map<number, number[]>();

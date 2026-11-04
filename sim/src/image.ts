@@ -3,7 +3,6 @@
  * blurs and an edge-following direction field. Uses only + - * / sqrt floor and dmath, so the
  * same image gives the same analysis on any JS engine.
  */
-import { dcbrt } from './dmath.ts';
 import { srgbToLinear } from './pigment.ts';
 
 /** 8-bit sRGB pixels, 3 bytes per pixel, row-major. */
@@ -73,13 +72,19 @@ export function boxBlur(src: Grid, r: number): Grid {
       sum += src.data[(y * w + (add >= w ? w - 1 : add)) * ch + k] - src.data[(y * w + (sub < 0 ? 0 : sub)) * ch + k];
     }
   }
-  for (let x = 0; x < w; x++) for (let k = 0; k < ch; k++) {
-    let sum = 0;
-    for (let y = -r; y <= r; y++) sum += tmp[((y < 0 ? 0 : y >= h ? h - 1 : y) * w + x) * ch + k];
-    for (let y = 0; y < h; y++) {
-      out[(y * w + x) * ch + k] = sum * norm;
-      const add = y + r + 1, sub = y - r;
-      sum += tmp[((add >= h ? h - 1 : add) * w + x) * ch + k] - tmp[((sub < 0 ? 0 : sub) * w + x) * ch + k];
+  // Column sweep row by row, one running sum per column and channel: the same additions in the
+  // same order as a per-column loop (so the same bits), reading memory sequentially.
+  const wc = w * ch, sums = new Float64Array(wc);
+  for (let y = -r; y <= r; y++) {
+    const row = (y < 0 ? 0 : y >= h ? h - 1 : y) * wc;
+    for (let j = 0; j < wc; j++) sums[j] += tmp[row + j];
+  }
+  for (let y = 0; y < h; y++) {
+    const row = y * wc, add = y + r + 1, sub = y - r;
+    const rowAdd = (add >= h ? h - 1 : add) * wc, rowSub = (sub < 0 ? 0 : sub) * wc;
+    for (let j = 0; j < wc; j++) {
+      out[row + j] = sums[j] * norm;
+      sums[j] += tmp[rowAdd + j] - tmp[rowSub + j];
     }
   }
   return { w, h, ch, data: out };
@@ -110,20 +115,43 @@ function tap3(src: Grid, a: number): Grid {
   return { w, h, ch, data: out };
 }
 
+/**
+ * dmath's dcbrt to the bit, with fewer iterations: dcbrt runs Newton's step 40 times from
+ * max(v, 1); after a few steps the iterate either stops changing (a fixed point, so every later
+ * step gives the same value) or alternates between two values (then step 40's value is decided by
+ * parity). Both are detected and the 40th iterate returned; anything else runs all 40 steps.
+ * `tests/planner.test.ts` checks it against dcbrt.
+ */
+export function cbrtFast(v: number): number {
+  if (v <= 0) return 0;
+  let x = v > 1 ? v : 1, prev = NaN;
+  for (let i = 0; i < 40; i++) {
+    const y = (2 * x + v / (x * x)) / 3;
+    if (y === x) return y;
+    if (y === prev) return (40 - (i + 1)) % 2 === 0 ? y : x;
+    prev = x; x = y;
+  }
+  return x;
+}
+
 /** Linear RGB -> OKLab. Distances in OKLab track perceived colour difference. */
 export function toOklab(lin: Grid): Grid {
-  const out = makeGrid(lin.w, lin.h, 3), n = lin.w * lin.h;
+  const out = makeGrid(lin.w, lin.h, 3), n = lin.w * lin.h, d = lin.data, o = out.data;
   for (let i = 0; i < n; i++) {
-    const r = lin.data[i * 3], g = lin.data[i * 3 + 1], b = lin.data[i * 3 + 2];
-    const [L, A, B] = oklab(r, g, b);
-    out.data[i * 3] = L; out.data[i * 3 + 1] = A; out.data[i * 3 + 2] = B;
+    const r = d[i * 3], g = d[i * 3 + 1], b = d[i * 3 + 2];
+    const l = cbrtFast(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+    const m = cbrtFast(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+    const s = cbrtFast(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+    o[i * 3] = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s;
+    o[i * 3 + 1] = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s;
+    o[i * 3 + 2] = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s;
   }
   return out;
 }
 export function oklab(r: number, g: number, b: number): [number, number, number] {
-  const l = dcbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
-  const m = dcbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
-  const s = dcbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+  const l = cbrtFast(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+  const m = cbrtFast(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+  const s = cbrtFast(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
   return [
     0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
     1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,

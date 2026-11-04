@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  canvasWidthMm, DEFAULT_LIGHT, DEFAULT_SETTINGS, downsampleSurface, ImpastoError, MAX_SIDE_MM, MIN_WIDTH_MM, planImpasto, planInWorker, renderImpasto, renderInWorker, resolvePreset, PRESET_NAMES,
+  canvasWidthMm, DEFAULT_LIGHT, DEFAULT_SETTINGS, downsampleSurface, ImpastoError, MAX_SIDE_MM, MIN_WIDTH_MM, planImpasto, planInWorker, relightSurface, renderImpasto, renderInWorker, resolvePreset, PRESET_NAMES,
   strokesToJSON, type ImpastoErrorCode, type ImpastoResult, type ImpastoSurface, type LayerSnapshot, type ProgressInfo,
 } from '../src/index.ts';
 import { serveImpasto, type WorkerResponse } from '../src/worker.ts';
@@ -67,6 +67,7 @@ test('api: invalid options reject with BAD_OPTION', async () => {
     { preset: 'watercolour' }, { widthMm: NaN }, { widthMm: '200' }, { seed: 1.5 }, { seed: Infinity },
     { light: { azimuth: 'left' } }, { light: { look: 'matte' } }, { light: null }, { advanced: 3 }, { advanced: { layers: [] } }, { onProgress: 'yes' }, null,
     { onLayer: 'yes' }, { snapshot: null }, { snapshot: { maxSide: 0 } }, { snapshot: { maxSide: 'big' } }, { snapshot: { maxSide: NaN } },
+    { image: 'small' }, { image: false }, { image: null },
   ];
   for (const o of bad) await assert.rejects(renderImpasto(img, o as never), hasCode('BAD_OPTION'), JSON.stringify(o));
 });
@@ -149,6 +150,42 @@ test('api: oil render gives RGBA, a matching surface and monotonic progress', as
   assert.deepEqual(r.light, resolvePreset('oil').light);
   assert.deepEqual(Object.keys(r.timings).sort(), ['analyse', 'paint', 'plan', 'relight', 'snapshot', 'surface', 'total']);
   assert.equal(r.timings.snapshot, 0, 'no snapshots without onLayer');
+});
+
+test("api: image: 'none' skips the relight and nothing else", async () => {
+  const img = tiny(), opts = { widthMm: 30, advanced: { layers: DEFAULT_SETTINGS.layers.slice(0, 3) } };
+  const full = await renderImpasto(img, opts);
+  const events: ProgressInfo[] = [];
+  const none = await renderImpasto(img, { ...opts, image: 'none', onProgress: (p) => events.push(p) });
+  assert.equal(none.image, null);
+  assert.equal(none.timings.relight, 0);
+  // Everything the painting determines is the same, and the explicit 'full' is the default.
+  assert.equal(sha([surfaceSha(none.surface), JSON.stringify(none.strokeList), JSON.stringify(none.layerNames), none.strokes].join()), sha([surfaceSha(full.surface), JSON.stringify(full.strokeList), JSON.stringify(full.layerNames), full.strokes].join()));
+  assert.deepEqual(none.light, full.light);
+  assert.deepEqual(Object.keys(none.timings).sort(), Object.keys(full.timings).sort());
+  assert.equal(resultSha(await renderImpasto(img, { ...opts, image: 'full' })), resultSha(full));
+  // Progress still runs to the end: analyse, every layer, done at 1; no relight stage.
+  const layers = full.layerNames.length;
+  assert.deepEqual(events.map((e) => e.stage), ['analyse', ...Array(layers).fill('paint'), 'done']);
+  for (let i = 1; i < events.length; i++) assert.ok(events[i].fraction > events[i - 1].fraction);
+  assert.equal(events.at(-1)!.fraction, 1);
+  // The static image can still be made later from the surface (float32 heights: within rounding of the CPU image).
+  const later = relightSurface(none.surface, none.light);
+  const direct = rgbOf(full.image.data);
+  let diff = 0;
+  for (let i = 0; i < later.length; i++) diff += Math.abs(later[i] - direct[i]);
+  assert.ok(diff / later.length < 1, `mean difference ${diff / later.length}`);
+  // Through the worker: the option crosses, the result transfers without an image buffer.
+  const { port1, port2 } = new MessageChannel();
+  serveImpasto(port2 as never);
+  try {
+    const w = await renderInWorker(port1 as never, img, { ...opts, image: 'none' });
+    assert.equal(w.image, null);
+    assert.equal(surfaceSha(w.surface), surfaceSha(full.surface));
+    assert.deepEqual(w.strokeList, full.strokeList);
+    const w2 = await renderInWorker(port1 as never, img, opts);
+    assert.equal(resultSha(w2), resultSha(full));
+  } finally { port1.close(); port2.close(); }
 });
 
 test('api: the locked preset paints exactly what the CLI paints', async () => {
