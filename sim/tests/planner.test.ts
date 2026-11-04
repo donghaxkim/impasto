@@ -29,6 +29,8 @@ const SMALL: Partial<PlanSettings> = { widthMm: 120, layers: scaleLayers(DEFAULT
 const ROUND3: Partial<PlanSettings> = { formSizesMm: [], underTone: 0, restraint: 0, presses: false, autoScale: false };
 /** 'oil' with shapes but fixed knife sizes, for tests that measure against the image in mm. */
 const OIL: Partial<PlanSettings> = { ...SMALL, look: 'oil', autoScale: false };
+/** The round-5 options (shading direction, value bands, press restraint) turned off. */
+const NO_PLANES: Partial<PlanSettings> = { shading: 0, valueBands: 0, pressRestraint: 0 };
 const digest = (o: unknown) => createHash('sha256').update(JSON.stringify(o)).digest('hex');
 
 test('planner: same image, settings and seed give an identical plan; a new seed differs', () => {
@@ -540,13 +542,13 @@ test('shading: on a form turning in the light, strokes run along its iso-luminan
     }
     return { up, all, presses, upPresses };
   };
-  const img = turningBox(), off = onTurn(planPainting(img, OIL)), shaded = onTurn(planPainting(img, { ...OIL, shading: 3 }));
-  const banded = onTurn(planPainting(img, { ...OIL, shading: 3, valueBands: 0.09 }));
+  const img = turningBox(), off = onTurn(planPainting(img, { ...OIL, ...NO_PLANES })), shaded = onTurn(planPainting(img, { ...OIL, ...NO_PLANES, shading: 3 }));
+  const banded = onTurn(planPainting(img, { ...OIL, ...NO_PLANES, shading: 3, valueBands: 0.09 }));
   assert.ok(shaded.up / shaded.all > off.up / off.all + 0.1 && shaded.up >= shaded.all * 0.85, `upright on the turn: ${off.up}/${off.all} without, ${shaded.up}/${shaded.all} with shading`);
   // Value bands: the turn is covered by many presses, one per band and along it.
   assert.ok(banded.presses >= 3 * Math.max(1, off.presses) && banded.upPresses >= banded.presses * 0.8, `presses on the turn: ${off.presses} without bands, ${banded.upPresses}/${banded.presses} upright with`);
   // 'locked' ignores all of it.
-  assert.equal(digest(planPainting(img, { ...SMALL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 }).strokes), digest(planPainting(img, SMALL).strokes));
+  assert.equal(digest(planPainting(img, { ...SMALL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 }).strokes), digest(planPainting(img, { ...SMALL, ...NO_PLANES }).strokes));
 });
 
 /** A broad, strongly textured warm ellipse (80 x 55 mm at 120 mm wide) on a dark ground: a plane full of pores. */
@@ -563,7 +565,7 @@ function texturedBlob(w = 240, h = 160): RgbImage {
 test('press restraint: later layers hold back inside presses that match; small features still get their marks', () => {
   const img = texturedBlob();
   const later = (plan: ReturnType<typeof planPainting>) => plan.strokes.filter((st) => ['forms', 'detail', 'accents'].includes(plan.layerNames[st.layer]) && st.footprint.every(([x, y]) => Math.hypot((x / 0.5 - 120) / 80, (y / 0.5 - 80) / 55) < 1)).length;
-  const free = later(planPainting(img, OIL)), held = later(planPainting(img, { ...OIL, pressRestraint: 0.8 }));
+  const free = later(planPainting(img, { ...OIL, pressRestraint: 0 })), held = later(planPainting(img, { ...OIL, pressRestraint: 0.8 }));
   assert.ok(held < free * 0.85, `${held} later strokes inside the blob with press restraint, ${free} without`);
   const plan = planPainting(facade(), { ...OIL, shading: 3, valueBands: 0.09, pressRestraint: 0.8 });
   const light = (st: PlannedStroke) => st.primary[0] + st.primary[1] + st.primary[2] > 2.2;

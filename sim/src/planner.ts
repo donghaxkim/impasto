@@ -264,7 +264,7 @@ export const DEFAULT_LAYERS: LayerSpec[] = [
 export const DEFAULT_SETTINGS: PlanSettings = {
   widthMm: 240, layers: DEFAULT_LAYERS, seed: 1, analysisMm: 0.5,
   flatDirection: [1, 0], flatBias: 0.12, formWeight: 1.5, formSizesMm: [80, 35, 15], ground: [0.58, 0.47, 0.37], chroma: 1.06,
-  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3, shading: 0, valueBands: 0, pressRestraint: 0,
+  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3, shading: 3, valueBands: 0.09, pressRestraint: 0.8,
 };
 
 /** Scale every length in the layers, for canvases larger or smaller than ~240 mm. */
@@ -422,20 +422,36 @@ export class Planner {
    * Value band per cell for splitRegions: form-scale lightness (blurred as for the shading direction
    * at blade width W) quantised in steps of `valueBands`, centred on each shape's mean so a shape's
    * own value sits in the middle of a band. Where the shading cue is weak (flat or textured areas),
-   * band 0: the shape is not split there.
+   * band 0: the shape is not split there. Only shapes whose own lightness turns by at least one band
+   * (15th to 85th percentile inside the shape) are split: blurred lightness bleeds
+   * across a flat shape's silhouette and would otherwise read as a turn. `turns` marks their cells.
    */
-  private valueBands(region: Regions, shade: Grid, W: number): Int32Array {
+  private valueBands(region: Regions, shade: Grid, W: number): { band: Int32Array; turns: Uint8Array } {
     const n = this.gw * this.gh, sigma = Math.max(0.5 * W, SHADE_MIN_MM / this.cell), Lg = makeGrid(this.gw, this.gh, 1);
     for (let i = 0; i < n; i++) Lg.data[i] = this.lab.data[i * 3];
-    const Lb = gaussBlur(Lg, sigma).data, sum = new Map<number, number>(), cnt = new Map<number, number>();
-    for (let i = 0; i < n; i++) { const lb = region.label[i]; if (lb >= 0) { sum.set(lb, (sum.get(lb) ?? 0) + Lb[i]); cnt.set(lb, (cnt.get(lb) ?? 0) + 1); } }
-    const band = new Int32Array(n), step = this.s.valueBands;
+    const Lb = gaussBlur(Lg, sigma).data, sum = new Map<number, number>(), vals = new Map<number, number[]>();
     for (let i = 0; i < n; i++) {
       const lb = region.label[i];
-      if (lb < 0 || shade.data[i * 4 + 2] < BAND_CUE) continue;
-      band[i] = Math.floor((Lb[i] - sum.get(lb)! / cnt.get(lb)!) / step + 0.5);
+      if (lb < 0) continue;
+      sum.set(lb, (sum.get(lb) ?? 0) + Lb[i]);
+      let v = vals.get(lb);
+      if (!v) vals.set(lb, (v = []));
+      v.push(Lg.data[i]);
     }
-    return band;
+    const step = this.s.valueBands, turning = new Set<number>();
+    for (const [lb, v] of vals) {
+      const a = Float64Array.from(v).sort();
+      if (a[Math.floor(0.85 * (a.length - 1))] - a[Math.floor(0.15 * (a.length - 1))] >= step) turning.add(lb);
+    }
+    const band = new Int32Array(n), turns = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      const lb = region.label[i];
+      if (lb < 0 || !turning.has(lb)) continue;
+      turns[i] = 1;
+      if (shade.data[i * 4 + 2] < BAND_CUE) continue;
+      band[i] = Math.floor((Lb[i] - sum.get(lb)! / vals.get(lb)!.length) / step + 0.5);
+    }
+    return { band, turns };
   }
 
   /** Plan one layer against `this.current`, append it to the plan, and update the estimate. */
@@ -676,10 +692,15 @@ export class Planner {
     // Nothing is freed for presses: a press never covers a thin shape (a mullion, a stem), however narrow.
     let region = regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W0 * W0, 0);
     // On smooth forms turning in the light, each shape is split into value bands: one press per band.
-    if (shade && this.s.valueBands > 0) region = splitRegions(region, gw, gh, this.valueBands(region, shade, W0 * 2), REGION_MIN * W0 * W0);
+    let turns: Uint8Array | null = null;
+    if (shade && this.s.valueBands > 0) {
+      const vb = this.valueBands(region, shade, W0 * 2);
+      region = splitRegions(region, gw, gh, vb.band, REGION_MIN * W0 * W0);
+      turns = vb.turns;
+    }
     // On those smooth forms a knife judges its fit against the image at its own scale (a plane
     // ignores skin texture finer than itself), so wider knives can take a band.
-    const planeRef = shade && this.s.valueBands > 0 ? sizes.map((sz) => toOklab(gaussBlur(this.lin, L.blur * sz / cell))) : null;
+    const planeRef = turns ? sizes.map((sz) => toOklab(gaussBlur(this.lin, L.blur * sz / cell))) : null;
     const cur = toOklab(this.current), err = new Float64Array(n);
     for (let i = 0; i < n; i++) err[i] = dist(ref.data, i * 3, cur.data, i * 3);
     const members = new Map<number, number[]>();
@@ -692,7 +713,7 @@ export class Planner {
       // as planes: enough presses to cover it (a whole face is one shape), not just 32, but each at
       // least half as wide as the widest already in it.
       let smoothCells = 0;
-      if (planeRef) for (const i of cells) if (shade!.data[i * 4 + 2] >= BAND_CUE) smoothCells++;
+      if (turns) for (const i of cells) if (turns[i] && shade!.data[i * 4 + 2] >= BAND_CUE) smoothCells++;
       const planes = smoothCells >= PLANE_SHARE * cells.length;
       const maxTries = planes ? Math.max(32, Math.ceil(cells.length / (W0 * W0))) : 32;
       let widest = 0;
@@ -702,7 +723,7 @@ export class Planner {
         if (best < 0) break;
         const x0 = best % gw + 0.5, y0 = (best - (best % gw)) / gw + 0.5;
         directionAt(flow, x0 - 0.5, y0 - 0.5, 0, 0, d);
-        const smoothForm = !!planeRef && shade!.data[best * 4 + 2] >= BAND_CUE;
+        const smoothForm = !!turns && turns[best] === 1 && shade!.data[best * 4 + 2] >= BAND_CUE;
         const refOf = (q: number) => (smoothForm ? planeRef![q] : ref);
         let col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
         // The widest knife that spans the shape here and whose two edges still land on its colour
