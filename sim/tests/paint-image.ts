@@ -2,11 +2,11 @@
  * Plan a painting from a photo and, unless --plan-only, paint it with the simulation.
  *
  *   node --experimental-strip-types tests/paint-image.ts [image.png] [--width 240] [--seed 1]
- *        [--layers N] [--plan-only] [--no-feedback] [--name lake]
+ *        [--layers N] [--plan-only] [--no-feedback] [--name lake] [--export-surface]
  *
  * Writes to out/: <name>-plan.png (what the planner expects), <name>-strokes.png (stroke
  * outlines, coloured by layer), <name>-plan.json, and with the simulation <name>-paint.png,
- * -color.png, -height.png and -light-opposite.png.
+ * -color.png, -height.png and -light-opposite.png; --export-surface adds <name>.impasto for the live viewer.
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -15,6 +15,7 @@ import { DEFAULT_SETTINGS, planPainting, type Plan } from '../src/planner.ts';
 import { canvasColour, paintStrokes, startPainting, type Painting } from '../src/execute.ts';
 import { DEFAULT_LIGHT, relight } from '../src/relight.ts';
 import { linearToSrgb } from '../src/pigment.ts';
+import { encodeSurface, surfaceFromCanvas } from '../src/surface.ts';
 
 const args = process.argv.slice(2);
 const opt = (name: string, def: string) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : def; };
@@ -67,6 +68,7 @@ if (painting) {
   writePng(`${out}${name}-height.png`, canvas.w, canvas.h, relight(canvas, LIGHT, 'height'));
   writePng(`${out}${name}-light-opposite.png`, canvas.w, canvas.h, relight(canvas, { ...LIGHT, azimuth: 45 }, 'paint'));
   console.log('sim s', (simMs / 1000).toFixed(1), 'relight s', ((Date.now() - t) / 4000).toFixed(1), 'per view; paint sha256', createHash('sha256').update(px).digest('hex').slice(0, 16));
+  if (flag('export-surface')) writeFileSync(`${out}${name}.impasto`, encodeSurface(surfaceFromCanvas(canvas))); // for npm run viewer / the live viewer
   const thick = new Float64Array(canvas.n);
   for (let i = 0; i < canvas.n; i++) thick[i] = canvas.top[i] + canvas.under[i];
   const sorted = thick.slice().sort();
