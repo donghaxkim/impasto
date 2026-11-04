@@ -68,13 +68,17 @@ export class PaintCanvas {
     const spill = Math.min(top[c], Math.max(0, top[c] + h - TOP_CAP));
     if (spill > 0) {
       const f = spill / top[c];
-      for (let k = 0; k < 3; k++) { const m = topP[i + k] * f; topP[i + k] -= m; underP[i + k] += m; }
+      let m = topP[i] * f; topP[i] -= m; underP[i] += m;
+      m = topP[i + 1] * f; topP[i + 1] -= m; underP[i + 1] += m;
+      m = topP[i + 2] * f; topP[i + 2] -= m; underP[i + 2] += m;
       top[c] -= spill; under[c] += spill;
     }
     top[c] += h; topP[i] += c0 * h; topP[i + 1] += c1 * h; topP[i + 2] += c2 * h;
     if (top[c] > TOP_CAP) {
       const over = top[c] - TOP_CAP, f = over / top[c];
-      for (let k = 0; k < 3; k++) { const m = topP[i + k] * f; topP[i + k] -= m; underP[i + k] += m; }
+      let m = topP[i] * f; topP[i] -= m; underP[i] += m;
+      m = topP[i + 1] * f; topP[i + 1] -= m; underP[i + 1] += m;
+      m = topP[i + 2] * f; topP[i + 2] -= m; underP[i + 2] += m;
       top[c] = TOP_CAP; under[c] += over;
     }
   }
@@ -89,13 +93,17 @@ export class PaintCanvas {
     const fromTop = Math.min(total, top[c]);
     if (fromTop > 0) {
       const f = fromTop >= top[c] ? 1 : fromTop / top[c];
-      for (let k = 0; k < 3; k++) { const m = topP[i + k] * f; topP[i + k] -= m; out[k + 1] += m; }
+      let m = topP[i] * f; topP[i] -= m; out[1] += m;
+      m = topP[i + 1] * f; topP[i + 1] -= m; out[2] += m;
+      m = topP[i + 2] * f; topP[i + 2] -= m; out[3] += m;
       top[c] = f === 1 ? 0 : top[c] - fromTop;
     }
     const fromUnder = total - fromTop;
     if (fromUnder > 0 && under[c] > 0) {
       const f = fromUnder >= under[c] ? 1 : fromUnder / under[c];
-      for (let k = 0; k < 3; k++) { const m = underP[i + k] * f; underP[i + k] -= m; out[k + 1] += m; }
+      let m = underP[i] * f; underP[i] -= m; out[1] += m;
+      m = underP[i + 1] * f; underP[i + 1] -= m; out[2] += m;
+      m = underP[i + 2] * f; underP[i + 2] -= m; out[3] += m;
       under[c] = f === 1 ? 0 : under[c] - fromUnder;
     }
     out[0] = total;
@@ -103,7 +111,9 @@ export class PaintCanvas {
     if (top[c] < TOP_CAP && under[c] > 0) {
       const pull = Math.min(TOP_CAP - top[c], under[c]);
       const f = pull >= under[c] ? 1 : pull / under[c];
-      for (let k = 0; k < 3; k++) { const m = underP[i + k] * f; underP[i + k] -= m; topP[i + k] += m; }
+      let m = underP[i] * f; underP[i] -= m; topP[i] += m;
+      m = underP[i + 1] * f; underP[i + 1] -= m; topP[i + 1] += m;
+      m = underP[i + 2] * f; underP[i + 2] -= m; topP[i + 2] += m;
       top[c] += pull; under[c] = f === 1 ? 0 : under[c] - pull;
     }
     return out;
@@ -240,11 +250,13 @@ export class PaintCanvas {
   }
   /** Moves paint from below the visible layer where possible, so relaxing height doesn't smear colour. */
   private moveTo(from: number, to: number, h: number): void {
-    const { top, under, topP, underP } = this;
+    const { top, under, underP } = this;
     const body = Math.min(h, under[from]);
     if (body > 0 && top[to] >= TOP_CAP * 0.5) {
-      const f = body >= under[from] ? 1 : body / under[from];
-      for (let k = 0; k < 3; k++) { const m = underP[from * 3 + k] * f; underP[from * 3 + k] -= m; underP[to * 3 + k] += m; }
+      const f = body >= under[from] ? 1 : body / under[from], f3 = from * 3, t3 = to * 3;
+      let m = underP[f3] * f; underP[f3] -= m; underP[t3] += m;
+      m = underP[f3 + 1] * f; underP[f3 + 1] -= m; underP[t3 + 1] += m;
+      m = underP[f3 + 2] * f; underP[f3 + 2] -= m; underP[t3 + 2] += m;
       under[from] = f === 1 ? 0 : under[from] - body;
       under[to] += body;
       h -= body;
@@ -255,7 +267,6 @@ export class PaintCanvas {
       const t = r[0];
       this.add(to, t, r[1] / t, r[2] / t, r[3] / t);
     }
-    void topP;
   }
 
   /** Relaxes the sheared face of a knife stroke to a smooth plane. Only moves paint under the visible layer. */
@@ -323,7 +334,9 @@ export class PaintCanvas {
       planes.set(site, Float64Array.of(mx, my, ms + (Math.abs(gx) + Math.abs(gy)) * sizeMm * 0.18, gx, gy));
     }
     const tiles = new Map<number, number[]>();
-    const target = new Map<number, number>();
+    // Target heights live in a canvas-sized scratch array (every cell in `cells` is written before it is read).
+    let target = this.facetTarget;
+    if (!target) target = this.facetTarget = new Float64Array(this.n);
     for (const c of cells) {
       const x = c % w, y = (c - x) / w, X = x * dx, Y = y * dx, S = this.surface(c);
       const gi = Math.floor(X / sizeMm), gj = Math.floor(Y / sizeMm);
@@ -338,7 +351,7 @@ export class PaintCanvas {
       }
       if (T > 1e17) T = S;
       T = T < S - 0.8 ? S - 0.8 : T > S + 0.8 ? S + 0.8 : T;
-      target.set(c, T);
+      target[c] = T;
       const tile = Math.floor(X / 6) * 1000 + Math.floor(Y / 6);
       let list = tiles.get(tile);
       if (!list) { list = []; tiles.set(tile, list); }
@@ -350,7 +363,7 @@ export class PaintCanvas {
       for (const c of list) { const S = this.surface(c); if (S < lo) lo = S; if (S > hi) hi = S; }
       for (const c of list) {
         const S = this.surface(c), share = smooth(((S - lo) / (hi - lo + 1e-6) - crest) / 0.35);
-        target.set(c, S + (target.get(c)! - S) * share);
+        target[c] = S + (target[c] - S) * share;
         if (share > 0.5) this.rough[c] = 0.06 + 0.04 * hash(c, seed, 5);
       }
     }
@@ -358,15 +371,15 @@ export class PaintCanvas {
   }
 
   /** Moves paint within these cells toward their target heights. Whatever is taken is put back. */
-  private redistribute(list: number[], target: Map<number, number>): void {
+  private redistribute(list: number[], target: Float64Array): void {
     let drift = 0;
-    for (const c of list) drift += this.surface(c) - target.get(c)!;
+    for (const c of list) drift += this.surface(c) - target[c];
     drift /= list.length;
     const pool = [0, 0, 0, 0];
     const short: number[] = [], need: number[] = [];
     let wanted = 0;
     for (const c of list) {
-      const T = Math.max(this.tooth[c], target.get(c)! + drift), delta = T - this.surface(c);
+      const T = Math.max(this.tooth[c], target[c] + drift), delta = T - this.surface(c);
       if (delta >= 0) { if (delta > 0) { short.push(c); need.push(delta); wanted += delta; } continue; }
       let take = -delta;
       const body = Math.min(take, this.under[c]);
