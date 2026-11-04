@@ -190,6 +190,18 @@ export interface PlanSettings {
    * are exempt. 0 is off.
    */
   pressRestraint: number;
+  /**
+   * With the 'oil' look: paint stiffness, 0-1 (StrokeSpec.stiffness). Stiff paint holds the knife's
+   * shape like dried palette-knife impasto: steep walls, flat pressed plateaus, sharp lips and
+   * creased peaks, later strokes sitting crisply on earlier ones with little bleed. 0 gives the
+   * wet, slumping paint of earlier rounds.
+   */
+  stiffness: number;
+  /**
+   * With the 'oil' look: multiplier on the paint knife strokes leave under the blade (each layer's
+   * gapMm), so slabs stand thicker. 1 keeps the layers' own thickness.
+   */
+  thickness: number;
 }
 
 export interface PlannedStroke {
@@ -220,6 +232,8 @@ export interface PlannedStroke {
   pressure: number[]; attackDeg: number; speed: number;
   /** 'physical' when berms and heap follow the hand (the 'oil' look); 'locked' otherwise. */
   deposition: 'locked' | 'physical';
+  /** Paint stiffness for paintStroke (the 'oil' look with PlanSettings.stiffness above 0; absent otherwise). */
+  stiffness?: number;
 }
 
 export interface Plan {
@@ -264,7 +278,7 @@ export const DEFAULT_LAYERS: LayerSpec[] = [
 export const DEFAULT_SETTINGS: PlanSettings = {
   widthMm: 240, layers: DEFAULT_LAYERS, seed: 1, analysisMm: 0.5,
   flatDirection: [1, 0], flatBias: 0.12, formWeight: 1.5, formSizesMm: [80, 35, 15], ground: [0.58, 0.47, 0.37], chroma: 1.06,
-  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3, shading: 3, valueBands: 0.09, pressRestraint: 0.8,
+  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3, shading: 3, valueBands: 0.09, pressRestraint: 0.8, stiffness: 1, thickness: 1.2,
 };
 
 /** Scale every length in the layers, for canvases larger or smaller than ~240 mm. */
@@ -1241,7 +1255,8 @@ export class Planner {
       pressure = pressure.map((p, q) => p * clamp((ratios[q] - 0.2) / 0.8, 0.3, 1.15));
     }
     pressure = pressure.map((p) => Math.round(p * 1000) / 1000);
-    const gap = L.gapMm * (1 - s.lightBoost * 0.5 + s.lightBoost * lightness) * shape.gap;
+    const thick = s.look === 'oil' && L.tool === 'knife' && s.thickness !== 1 ? s.thickness : 1;
+    const gap = L.gapMm * (1 - s.lightBoost * 0.5 + s.lightBoost * lightness) * shape.gap * thick;
     const minLoad = s.minLoad * shape.load;
     return {
       index, layer: l, tool: this.toolBase[l] + (t.size ?? 0) * FAMILIES + colourFamily(t.lab), points: path, footprint,
@@ -1256,6 +1271,8 @@ export class Planner {
       edgeFlaws: s.look === 'oil' ? EDGE_FLAWS[shape.primitive] : 1,
       pressure, attackDeg: Math.round(shape.attackDeg * 10) / 10, speed: shape.speed,
       deposition: s.look === 'oil' ? 'physical' : 'locked',
+      // Knife paint is stiff; the thinned bristle underpainting stays fluid.
+      ...(s.look === 'oil' && s.stiffness > 0 && L.tool === 'knife' ? { stiffness: clamp01(s.stiffness) } : {}),
       seed: (Math.floor(hash(seed, index, 13) * 2147483647) | 0) + 1,
     };
   }

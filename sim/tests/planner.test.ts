@@ -455,6 +455,37 @@ test('locked: the plan is exactly the round-3 plan (the regression baseline)', (
   assert.ok(!p.layerNames.includes('presses'));
 });
 
+test('stiff paint: oil knives are stiff and thicker by default; stiffness 0 and thickness 1 paint exactly the earlier oil', () => {
+  const img = landscape(120, 60);
+  const settings: Partial<PlanSettings> = { widthMm: 60, layers: scaleLayers(DEFAULT_SETTINGS.layers.slice(0, 3), 0.5), analysisMm: 0.5, seed: 9, look: 'oil' };
+  const run = (extra: Partial<PlanSettings>) => {
+    let painting = null as ReturnType<typeof startPainting> | null;
+    const plan = planPainting(img, { ...settings, ...extra }, (layer, strokes, estimate, partial) => {
+      painting ??= startPainting(partial, DEFAULT_SETTINGS.ground);
+      paintStrokes(painting, strokes);
+      return canvasColour(painting.canvas, estimate.w, estimate.h);
+    });
+    const c = painting!.canvas;
+    const fp = createHash('sha256').update(Buffer.from(c.top.buffer)).update(Buffer.from(c.under.buffer)).update(Buffer.from(c.topP.buffer)).update(Buffer.from(c.underP.buffer)).digest('hex');
+    let loaded = 0, held = c.totalVolume() + c.lost;
+    for (const t of painting!.tools) { loaded += t.loaded; held += t.residual() + t.wiped; }
+    assert.ok(Math.abs(loaded - held) / loaded < 1e-9, `volume ${loaded} vs ${held}`);
+    return { plan, fp };
+  };
+  // Plan and canvas of the oil look before stiff paint (commit 9de48f5) for this image and these settings.
+  const wet = run({ stiffness: 0, thickness: 1 });
+  assert.equal(digest(wet.plan.strokes), '4328bad8cba41eaaa336791021595b93c36286f11d35c56a125967ccf9fd3700');
+  assert.equal(wet.fp, 'b2c52b7f41fb023061d7f61d1b698e16f2a8d12d9099ae0e900bbf9ff79851a6');
+  assert.ok(wet.plan.strokes.every((st) => st.stiffness === undefined));
+  // The default: knife strokes are stiff and laid thicker; the bristle underpainting stays fluid.
+  const stiff = run({});
+  assert.ok(DEFAULT_SETTINGS.stiffness > 0 && DEFAULT_SETTINGS.thickness > 1);
+  for (const st of stiff.plan.strokes) assert.equal(st.stiffness, st.primitive === 'underpaint' ? undefined : DEFAULT_SETTINGS.stiffness);
+  assert.notEqual(stiff.fp, wet.fp);
+  // The locked look never carries the setting.
+  assert.ok(planPainting(img, { ...settings, look: 'locked' }).strokes.every((st) => st.stiffness === undefined));
+});
+
 test('presses: a shape gets one wide press across it, and presses stay short and wide', () => {
   const plan = planPainting(figure(), OIL);
   const presses = plan.strokes.filter((st) => st.primitive === 'press');

@@ -278,6 +278,38 @@ test('wet contacts relax into fillets while edges on bare canvas stay steep', ()
   assert.ok(wetSum / k < bareSum / k * 0.75, `wet ${(wetSum / k).toFixed(2)} vs bare ${(bareSum / k).toFixed(2)}`);
 });
 
+test('stiff paint holds its step onto earlier paint and keeps a sharper lip, and is conserved', () => {
+  // The scene above, with both strokes stiff or both wet: a cream stroke dragged over a blue bed.
+  const scene = (stiffness: number) => {
+    const c = new PaintCanvas(100, 70, 0.1, GROUND, 3);
+    const bed = new Tool({ kind: 'knife', widthMm: 42, nodes: 128, seed: 21 });
+    bed.load(40, BLUE, BLUE, 0, 3);
+    paintStroke(c, bed, { points: [[6, 35], [35, 35], [65, 35], [94, 35]], gapMm: 1.4, seed: 301, stiffness });
+    const t = new Tool({ kind: 'knife', widthMm: 18, nodes: 128, seed: 7 });
+    t.load(22, CREAM, CREAM, 0, 5);
+    paintStroke(c, t, { points: [[12, 35], [38, 35], [62, 35], [88, 35]], gapMm: 1.0, seed: 99, deposition: 'physical', stiffness });
+    assertConserved(c, [bed, t]);
+    // Across the upper edge of the cream stroke: the steepest slope (the step) and the sharpest
+    // crest (most negative second difference: the lip), averaged along the stroke.
+    const S = surfaceField(c);
+    let steep = 0, crest = 0, k = 0;
+    for (let x = 300; x <= 620; x += 16) {
+      let m = 0, cm = 0;
+      for (let y = 200; y < 290; y++) {
+        const i = y * c.w + x;
+        m = Math.max(m, Math.abs(S[i + c.w] - S[i - c.w]) / (2 * c.dx));
+        cm = Math.max(cm, -(S[i + c.w] + S[i - c.w] - 2 * S[i]) / (c.dx * c.dx));
+      }
+      steep += m; crest += cm; k++;
+    }
+    return { steep: steep / k, crest: crest / k };
+  };
+  const wet = scene(0), stiff = scene(1);
+  assert.ok(stiff.steep > wet.steep * 1.5, `step: stiff ${stiff.steep.toFixed(2)} vs wet ${wet.steep.toFixed(2)}`);
+  assert.ok(stiff.steep > 2, `stiff step ${stiff.steep.toFixed(2)}`);
+  assert.ok(stiff.crest > wet.crest * 1.2, `lip crest: stiff ${stiff.crest.toFixed(1)} vs wet ${wet.crest.toFixed(1)}`);
+});
+
 test('near-black stays rare and out of thin lines, and a tall undercut still casts a deep shadow', () => {
   const { canvas: c } = patchScene();
   const px = relight(c, DEFAULT_LIGHT, 'paint');

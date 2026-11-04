@@ -19,7 +19,7 @@ export function paintStrokes(p: Painting, strokes: readonly PlannedStroke[]): vo
     tool.wipe(st.wipe);
     if (st.profile) tool.loadProfile(st.volumePerNode, st.profile, st.secondary, st.secondaryFraction, st.mix ?? 1, st.seed ^ 0x5bd1e995);
     else tool.load(st.volumePerNode, st.primary, st.secondary, st.secondaryFraction, st.seed ^ 0x5bd1e995);
-    p.stats.push(paintStroke(p.canvas, tool, { points: st.points, gapMm: st.gapMm, pressMm: st.pressMm, seed: st.seed, engage: st.engage, taper: st.taper, taperMin: st.taperMin, breaks: st.breaks, heap: st.heap, edgeFlaws: st.edgeFlaws, pressure: st.pressure, attackDeg: st.attackDeg, speed: st.speed, deposition: st.deposition }));
+    p.stats.push(paintStroke(p.canvas, tool, { points: st.points, gapMm: st.gapMm, pressMm: st.pressMm, seed: st.seed, engage: st.engage, taper: st.taper, taperMin: st.taperMin, breaks: st.breaks, heap: st.heap, edgeFlaws: st.edgeFlaws, pressure: st.pressure, attackDeg: st.attackDeg, speed: st.speed, deposition: st.deposition, stiffness: st.stiffness }));
   }
 }
 

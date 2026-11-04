@@ -55,6 +55,13 @@ export interface StrokeSpec {
    * turn). Volume and pigment are conserved either way.
    */
   deposition?: 'locked' | 'physical';
+  /**
+   * Paint stiffness (yield stress), 0-1 (default 0, the reference wet paint). Stiff paint holds the
+   * shape the knife gives it: little slumping or levelling, no fillet where it meets earlier paint
+   * and little pigment bleed or pickup there, berms and heaps that stand as sharp-crested lips and
+   * creased peaks, and a blade face pressed flat. Volume and pigment are conserved either way.
+   */
+  stiffness?: number;
 }
 
 /** Pressure at a fraction t (0-1) of the stroke, from a sample profile. */
@@ -316,6 +323,9 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
   const liftP = physical ? clamp(pressureAt(profile, 1), 0, 1.5) : 1;
   const press = stroke.pressMm ?? 0;
   const ringR = Math.max(2, Math.round(0.45 / dx));
+  const stiff = clamp(stroke.stiffness ?? 0, 0, 1);
+  // Stiff paint: less of what the knife plows up joins its load, so its colour stays clean.
+  const take = stiff > 0 ? pickupFraction * (1 - 0.7 * stiff) : pickupFraction;
 
   const start = new Float64Array(N), end = new Float64Array(N), dumped = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
@@ -477,7 +487,6 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
         const r = canvas.remove(c, surf0 - zHere);
         if (r[0] > 0) {
           const vol = r[0] * area;
-          const take = pickupFraction;
           v[i] += vol * take; wv[i] += vol * (1 - take);
           stats.plowedVolume += vol * (1 - take);
           for (let k = 0; k < 3; k++) { const m = r[k + 1] * area; p[ni + k] += m * take; wp[ni + k] += m * (1 - take); }
@@ -661,7 +670,7 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
         const q = (edgeIndex / N - 0.5) * W + (side === 0 ? -1 : 1) * R * 0.25;
         const cx = px + nx * q, cy = py + ny * q;
         const conc = 1 / stored;
-        canvas.cone(cx, cy, R, vol, tool.edgeP[pi] * conc, tool.edgeP[pi + 1] * conc, tool.edgeP[pi + 2] * conc, 0.10 + 0.06 * noise1(s * 0.7, seed, 55), 2);
+        canvas.cone(cx, cy, R, vol, tool.edgeP[pi] * conc, tool.edgeP[pi + 1] * conc, tool.edgeP[pi + 2] * conc, 0.10 + 0.06 * noise1(s * 0.7, seed, 55), 2, stiff);
         stats.bermVolume += vol;
         tool.edgeV[side] -= vol;
         for (let k = 0; k < 3; k++) tool.edgeP[pi + k] -= tool.edgeP[pi + k] * emitFrac;
@@ -712,10 +721,14 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
       // The bead slides off as a short tongue, not a ball.
       const c0 = moving[0] / vol, c1 = moving[1] / vol, c2 = moving[2] / vol;
       const rough = 0.12 + 0.04 * hash(i, seed, 64);
+      // Stiff paint is pulled up by the lifting blade: the tongue rises to a narrower crest at its
+      // front instead of spreading evenly, so the stroke ends in a raised, ragged lip.
+      const Rh = stiff > 0 ? R * 0.8 * (1 - 0.25 * stiff) : R * 0.8;
       for (let part = 0; part < 4; part++) {
         const a = (part + 1) / 4;
         const jitter = (hash(i, seed, 65 + part) - 0.5) * R * 0.9;
-        canvas.cone(px + nx * (q + jitter) + tx * fwd * a, py + ny * (q + jitter) + ty * fwd * a, R * 0.8, vol * 0.25, c0, c1, c2, rough, 1);
+        const share = stiff > 0 ? 0.25 + (0.1 * (part + 1) - 0.25) * stiff : 0.25;
+        canvas.cone(px + nx * (q + jitter) + tx * fwd * a, py + ny * (q + jitter) + ty * fwd * a, Rh, vol * share, c0, c1, c2, rough, 1, stiff);
       }
       const cx = px + nx * q + tx * fwd, cy = py + ny * q + ty * fwd;
       stats.heapVolume += vol;
@@ -737,12 +750,21 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
   }
 
   const pad = Math.ceil(2 / dx);
-  canvas.slump(x1 - pad, y1 - pad, x2 + pad, y2 + pad, knife ? 2.8 : 2.3, 3);
-  canvas.level(x1 - pad, y1 - pad, x2 + pad, y2 + pad, 0.1, 1);
-  canvas.levelFace(faceCells, face, passId, 0.22, 7);
-  // Rounded peaks are recut into crests; a knife leaves harder, larger planes than a brush.
-  canvas.facet(1, knife ? 0.6 : 0.5, knife ? 0.7 : 0.5, seed + 501);
-  canvas.blendWetContact(seed);
+  if (stiff > 0) {
+    // Stiff paint: only near-vertical slopes give way, levelling just takes the voxel step off,
+    // and the blade face is pressed flatter. More of each heap is recut into creased planes.
+    canvas.slump(x1 - pad, y1 - pad, x2 + pad, y2 + pad, (knife ? 2.8 : 2.3) * (1 + 1.5 * stiff), 3);
+    canvas.level(x1 - pad, y1 - pad, x2 + pad, y2 + pad, 0.1 * (1 - 0.7 * stiff), 1);
+    canvas.levelFace(faceCells, face, passId, 0.22, 7 + Math.round(5 * stiff));
+    canvas.facet(1, knife ? 0.6 : 0.5, (knife ? 0.7 : 0.5) * (1 + 0.5 * stiff), seed + 501, 0.3 - 0.15 * stiff);
+  } else {
+    canvas.slump(x1 - pad, y1 - pad, x2 + pad, y2 + pad, knife ? 2.8 : 2.3, 3);
+    canvas.level(x1 - pad, y1 - pad, x2 + pad, y2 + pad, 0.1, 1);
+    canvas.levelFace(faceCells, face, passId, 0.22, 7);
+    // Rounded peaks are recut into crests; a knife leaves harder, larger planes than a brush.
+    canvas.facet(1, knife ? 0.6 : 0.5, knife ? 0.7 : 0.5, seed + 501);
+  }
+  canvas.blendWetContact(seed, stiff);
   return stats;
 }
 

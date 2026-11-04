@@ -39,10 +39,12 @@ const img = readPng(new URL(`../${scene.image}`, import.meta.url).pathname);
 const look = opt('look', 'locked') as 'locked' | 'oil';
 // --forms 0 turns the form hierarchy off, --streaks 0 the streaked loads, --tone 0 the toned underpainting,
 // --restraint 0 restraint, --presses 0 the press layer and short strokes, --scale 0 the knife scaling;
-// --shading, --bands and --press-restraint set the shading direction, value bands and press restraint.
+// --shading, --bands and --press-restraint set the shading direction, value bands and press restraint;
+// --stiffness the paint's stiffness (0 for the wet paint of earlier rounds) and --thickness the knife paint's thickness.
 const formSizesMm = opt('forms', '') === '0' ? [] : DEFAULT_SETTINGS.formSizesMm;
 const settings = { ...DEFAULT_SETTINGS, widthMm, look, formSizesMm, streaks: opt('streaks', '1') !== '0', underTone: +opt('tone', String(DEFAULT_SETTINGS.underTone)), restraint: +opt('restraint', String(DEFAULT_SETTINGS.restraint)), presses: opt('presses', '1') !== '0', autoScale: opt('scale', '1') !== '0', deferThin: opt('defer', DEFAULT_SETTINGS.deferThin ? '1' : '0') === '1',
-  shading: +opt('shading', String(DEFAULT_SETTINGS.shading)), valueBands: +opt('bands', String(DEFAULT_SETTINGS.valueBands)), pressRestraint: +opt('press-restraint', String(DEFAULT_SETTINGS.pressRestraint)) };
+  shading: +opt('shading', String(DEFAULT_SETTINGS.shading)), valueBands: +opt('bands', String(DEFAULT_SETTINGS.valueBands)), pressRestraint: +opt('press-restraint', String(DEFAULT_SETTINGS.pressRestraint)),
+  stiffness: +opt('stiffness', String(DEFAULT_SETTINGS.stiffness)), thickness: +opt('thickness', String(DEFAULT_SETTINGS.thickness)) };
 const LIGHT = { ...DEFAULT_LIGHT, look };
 const VIEWS: View[] = ['paint', 'normal', 'cavity'];
 

@@ -125,11 +125,18 @@ export class PaintCanvas {
     if (this.touch[c] !== this.strokeId) { this.touch[c] = this.strokeId; this.touched.push(c); }
   }
 
-  /** Mass-conserving rounded dome of paint with a definite contact edge, used for berms and heaps. */
-  cone(xMm: number, yMm: number, radiusMm: number, volume: number, c0: number, c1: number, c2: number, rough: number, kind: 0 | 1 | 2 = 0): void {
+  /**
+   * Mass-conserving rounded dome of paint with a definite contact edge, used for berms and heaps.
+   * `sharp` (0-1, stiff paint) blends the dome toward a peaked cone that keeps a steep skirt at its contact edge,
+   * so overlapping cones build a ridge with a crisp crest instead of a rounded bead.
+   */
+  cone(xMm: number, yMm: number, radiusMm: number, volume: number, c0: number, c1: number, c2: number, rough: number, kind: 0 | 1 | 2 = 0, sharp = 0): void {
     if (volume <= 0) return;
     const { dx } = this;
     const R = Math.max(radiusMm, dx * 1.2);
+    const weight = sharp > 0
+      ? (rr: number) => { if (rr <= 0.15) return 0; const dome = Math.sqrt(rr); return dome + (1 - 0.7 * Math.sqrt(1 - rr) - dome) * sharp; }
+      : (rr: number) => (rr > 0.15 ? Math.sqrt(rr) : 0);
     const x0 = Math.floor((xMm - R) / dx), x1 = Math.ceil((xMm + R) / dx);
     const y0 = Math.floor((yMm - R) / dx), y1 = Math.ceil((yMm + R) / dx);
     // Weights cover the whole cone: whatever falls past the canvas edge is recorded as lost
@@ -137,7 +144,7 @@ export class PaintCanvas {
     let sum = 0, inside = 0;
     for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
       const ex = (x + 0.5) * dx - xMm, ey = (y + 0.5) * dx - yMm;
-      const rr = 1 - (ex * ex + ey * ey) / (R * R), w = rr > 0.15 ? Math.sqrt(rr) : 0;
+      const rr = 1 - (ex * ex + ey * ey) / (R * R), w = weight(rr);
       if (w > 0) { sum += w; if (this.inBounds(x, y)) inside += w; }
     }
     if (sum <= 0) sum = inside = 1;
@@ -150,7 +157,7 @@ export class PaintCanvas {
     for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
       if (!this.inBounds(x, y)) continue;
       const ex = (x + 0.5) * dx - xMm, ey = (y + 0.5) * dx - yMm;
-      const rr = 1 - (ex * ex + ey * ey) / (R * R), w = rr > 0.15 ? Math.sqrt(rr) : 0;
+      const rr = 1 - (ex * ex + ey * ey) / (R * R), w = weight(rr);
       if (w > 0) {
         const c = y * this.w + x;
         this.mark(c);
@@ -243,7 +250,7 @@ export class PaintCanvas {
    * random tilt, and the surface takes the lowest plane nearby. Taking the minimum keeps it
    * continuous and turns every join into a sharp ridge. Volume is preserved within each tile.
    */
-  facet(kind: 1 | 2, sizeMm: number, tilt: number, seed: number): void {
+  facet(kind: 1 | 2, sizeMm: number, tilt: number, seed: number, crest = 0.3): void {
     const cells = kind === 1 ? this.heapCells : this.bermCells;
     if (cells.length < 12) return;
     const { w, dx } = this, id = this.strokeId * 2 + kind;
@@ -304,7 +311,7 @@ export class PaintCanvas {
       let lo = 1e18, hi = -1e18;
       for (const c of list) { const S = this.surface(c); if (S < lo) lo = S; if (S > hi) hi = S; }
       for (const c of list) {
-        const S = this.surface(c), share = smooth(((S - lo) / (hi - lo + 1e-6) - 0.3) / 0.35);
+        const S = this.surface(c), share = smooth(((S - lo) / (hi - lo + 1e-6) - crest) / 0.35);
         target.set(c, S + (target.get(c)! - S) * share);
         if (share > 0.5) this.rough[c] = 0.06 + 0.04 * hash(c, seed, 5);
       }
@@ -357,8 +364,14 @@ export class PaintCanvas {
    * Where a stroke meets paint that is already there, wet paint flows together: the step relaxes
    * into a fillet and pigment bleeds across the join. Edges on bare canvas are left steep.
    */
-  blendWetContact(seed: number): void {
+  blendWetContact(seed: number, stiffness = 0): void {
     const { w, n, dx, top, under } = this, id = this.strokeId;
+    // Stiff paint (high yield stress) holds a real step: where neighbouring cells differ by more
+    // than `tall`, the fillet only knocks off what is steeper than about 80 degrees. Smaller steps
+    // (thin films caught on the weave, the skirt of a berm) still relax, so nothing reads as voxels.
+    // Pigment barely bleeds across the join.
+    const hold = stiffness > 0 ? 1 + 5 * stiffness : 1, bleed = stiffness > 0 ? 1 - 0.9 * stiffness : 1;
+    const tall = stiffness > 0 ? 1.5 * dx : 0;
     const paint = (c: number) => top[c] + under[c];
     const radius = Math.max(3, Math.round(0.8 / dx));
     const frontier: number[] = [];
@@ -386,8 +399,8 @@ export class PaintCanvas {
         for (const d of [x + 1 < w ? c + 1 : -1, c + w < n ? c + w : -1]) {
           if (d < 0 || this.band[d] !== id) continue;
           const near = Math.min(this.bandDist[c], this.bandDist[d]) / radius;
-          const limit = dx * (0.75 + 1.0 * near);
           const diff = this.surface(c) - this.surface(d);
+          const limit = dx * (0.75 + 1.0 * near) * (diff > tall || -diff > tall ? hold : 1);
           if (diff > limit) this.moveTo(c, d, (diff - limit) * 0.5);
           else if (-diff > limit) this.moveTo(d, c, (-diff - limit) * 0.5);
         }
@@ -403,7 +416,7 @@ export class PaintCanvas {
         const x = c % w, y = (c - x) / w;
         const gate = smooth((noise2(x * dx * 1.3, y * dx * 1.3, seed + 31) - 0.42) / 0.16);
         if (gate <= 0) continue;
-        const strength = 0.2 * (1 - dist / (reach + 1)) * gate;
+        const strength = 0.2 * (1 - dist / (reach + 1)) * gate * bleed;
         for (const d of [x + 1 < w ? c + 1 : -1, c + w < n ? c + w : -1]) {
           if (d < 0 || this.band[d] !== id || top[c] <= 1e-6 || top[d] <= 1e-6) continue;
           const shared = Math.min(top[c], top[d]) * strength;

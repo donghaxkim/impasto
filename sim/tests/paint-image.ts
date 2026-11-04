@@ -37,7 +37,9 @@ mkdirSync(out, { recursive: true });
 
 const img = readPng(imagePath);
 const formSizesMm = opt('forms', '') === '0' ? [] : opt('forms', '') ? opt('forms', '').split(',').map(Number) : DEFAULT_SETTINGS.formSizesMm;
-const settings = { ...DEFAULT_SETTINGS, widthMm, seed, minLoad, look, formSizesMm, layers: DEFAULT_SETTINGS.layers.slice(0, layerCount).map((l, i) => (i === 0 ? l : { ...l, gapMm: l.gapMm * gapScale })) };
+// --stiffness 0 gives the wet paint of earlier rounds under --look oil; --thickness scales oil knife paint.
+const stiffness = +opt('stiffness', String(DEFAULT_SETTINGS.stiffness)), thickness = +opt('thickness', String(DEFAULT_SETTINGS.thickness));
+const settings = { ...DEFAULT_SETTINGS, widthMm, seed, minLoad, look, formSizesMm, stiffness, thickness, layers: DEFAULT_SETTINGS.layers.slice(0, layerCount).map((l, i) => (i === 0 ? l : { ...l, gapMm: l.gapMm * gapScale })) };
 const t0 = Date.now();
 // The same pipeline as the library's renderImpasto (src/pipeline.ts).
 const { plan, painting, simMs } = runPipeline(img, settings, { simulate, feedback }, (e) => {
