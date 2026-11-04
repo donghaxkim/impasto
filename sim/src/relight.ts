@@ -21,9 +21,10 @@ export interface LightSettings {
 
 /**
  * Surface look. 'locked' is the reference: glossy wet paint, pin-prick crest glints, deep cavities.
- * 'oil' is semi-gloss and calmer: rougher coat, highlights filtered by how fast the normal turns
- * within a pixel (Kaplanyan's geometric specular anti-aliasing) so crests carry continuous sheens
- * instead of beads, weaker crest boost and second window, gentler cavities.
+ * 'oil' is dried, cured paint with a satin sheen: a rough coat (0.38 floor), no wet micro-facet
+ * glints or crest flash, highlights filtered by how fast the normal turns within a pixel
+ * (Kaplanyan's geometric specular anti-aliasing) so ridges carry broad soft sheens, and slightly
+ * deeper crevices.
  */
 export interface LookParams {
   /** Floor on clearcoat roughness. */
@@ -44,7 +45,9 @@ export interface LookParams {
 export type LookName = 'locked' | 'oil';
 export const LOOKS: Record<LookName, LookParams> = {
   locked: { coatMin: 0, micro: 1, crestBoost: 2.5, window2: 0.55, specGain: 1, specAA: 0, cavityKey: 0.6, cavityFill: 0.72, richness: 0.35 },
-  oil: { coatMin: 0.2, micro: 0.25, crestBoost: 0.8, window2: 0.25, specGain: 0.7, specAA: 1, cavityKey: 0.35, cavityFill: 0.45, richness: 0.22 },
+  // Dried paint: a satin coat (no wet micro-glints, no crest flash), a weak second window,
+  // and crevices that read a little deeper, as on cured knife work.
+  oil: { coatMin: 0.38, micro: 0, crestBoost: 0, window2: 0.1, specGain: 0.45, specAA: 1, cavityKey: 0.5, cavityFill: 0.6, richness: 0.3 },
 };
 export const DEFAULT_LIGHT: LightSettings = { azimuth: 225, elevation: 30, occlusion: 0.8, relief: 1, exposure: 1, glow: 1 };
 
