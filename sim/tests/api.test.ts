@@ -7,7 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
-  canvasWidthMm, DEFAULT_LIGHT, DEFAULT_SETTINGS, downsampleSurface, ImpastoError, MAX_SIDE_MM, MIN_WIDTH_MM, planImpasto, planInWorker, renderImpasto, renderInWorker, resolvePreset,
+  canvasWidthMm, DEFAULT_LIGHT, DEFAULT_SETTINGS, downsampleSurface, ImpastoError, MAX_SIDE_MM, MIN_WIDTH_MM, planImpasto, planInWorker, renderImpasto, renderInWorker, resolvePreset, PRESET_NAMES,
   strokesToJSON, type ImpastoErrorCode, type ImpastoResult, type ImpastoSurface, type LayerSnapshot, type ProgressInfo,
 } from '../src/index.ts';
 import { serveImpasto, type WorkerResponse } from '../src/worker.ts';
@@ -72,30 +72,19 @@ test('api: invalid options reject with BAD_OPTION', async () => {
 });
 
 test('api: presets resolve over the library defaults by reference', () => {
-  const oil = resolvePreset('oil'), locked = resolvePreset('locked'), smooth = resolvePreset('smooth');
+  const oil = resolvePreset('oil'), locked = resolvePreset('locked');
+  assert.deepEqual(PRESET_NAMES, ['oil', 'locked']);
   assert.deepEqual(oil.settings, { ...DEFAULT_SETTINGS, look: 'oil' });
-  assert.deepEqual(oil.light, { ...DEFAULT_LIGHT, look: 'oil' });
+  assert.deepEqual(oil.light, { ...DEFAULT_LIGHT, look: 'oil', glow: 0, occlusion: 0.95 });
   assert.deepEqual(locked.settings, { ...DEFAULT_SETTINGS, look: 'locked' });
   assert.deepEqual(locked.light, { ...DEFAULT_LIGHT, look: 'locked' });
-  // smooth: oil with more restraint, blended loads, thinner paint, fewer accents and softer light.
-  const s = smooth.settings;
-  assert.equal(s.look, 'oil');
-  assert.ok(s.restraint > DEFAULT_SETTINGS.restraint && s.restraint <= 1);
-  assert.equal(s.streaks, false);
-  assert.ok(s.lightBoost < DEFAULT_SETTINGS.lightBoost);
-  assert.deepEqual(s.layers.map((l) => l.name), DEFAULT_SETTINGS.layers.map((l) => l.name));
-  const by = (name: string, ls = s.layers) => ls.find((l) => l.name === name)!;
-  assert.ok(by('accents').threshold > by('accents', DEFAULT_SETTINGS.layers).threshold);
-  assert.ok(by('masses').gapMm < by('masses', DEFAULT_SETTINGS.layers).gapMm);
-  assert.equal(by('underpaint').gapMm, by('underpaint', DEFAULT_SETTINGS.layers).gapMm);
-  assert.ok(smooth.light.elevation > DEFAULT_LIGHT.elevation && smooth.light.relief < DEFAULT_LIGHT.relief && smooth.light.look === 'oil');
   // Overrides go on top, and nothing leaks back into the defaults.
-  const o = resolvePreset('smooth', { restraint: 0.1 }, { azimuth: 90 });
+  const o = resolvePreset('oil', { restraint: 0.1 }, { azimuth: 90 });
   assert.equal(o.settings.restraint, 0.1);
   assert.equal(o.light.azimuth, 90);
-  assert.equal(o.light.elevation, smooth.light.elevation);
+  assert.equal(o.light.occlusion, 0.95);
   const before = JSON.stringify([DEFAULT_SETTINGS, DEFAULT_LIGHT]);
-  for (const name of ['oil', 'locked', 'smooth'] as const) resolvePreset(name, { seed: 5 }, { glow: 0 });
+  for (const name of ['oil', 'locked'] as const) resolvePreset(name, { seed: 5 }, { glow: 0 });
   assert.equal(JSON.stringify([DEFAULT_SETTINGS, DEFAULT_LIGHT]), before);
 });
 

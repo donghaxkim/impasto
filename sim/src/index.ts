@@ -148,7 +148,7 @@ export interface SnapshotOptions {
 }
 
 export interface ImpastoOptions {
-  /** 'oil' (default) the intended look; 'locked' the round-3 reference; 'smooth' calmer and more blended. */
+  /** 'oil' (default): the look the site ships, dried satin knife paint. 'locked': the round-3 reference, kept for regression comparison. */
   preset?: PresetName;
   /**
    * Canvas width in mm (default DEFAULT_SETTINGS.widthMm, 240); the height follows the image.
