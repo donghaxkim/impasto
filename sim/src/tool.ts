@@ -19,7 +19,31 @@ export interface StrokeSpec {
   /** Extra depth the tool is pressed below the surface it rides on, mm. Plows wet paint. */
   pressMm?: number;
   seed: number;
+  /** Share of the blade in contact, centred (0-1, default 1). A narrower mark from the same tool. */
+  engage?: number;
+  /**
+   * Tapered ends: the share of the stroke's length over which contact narrows to `taperMin` of
+   * the engaged width at the head and at the tail. Default [0, 0], square ends.
+   */
+  taper?: readonly [number, number];
+  /** Contact width at the very tip of a taper, as a share of the engaged width (default 0.2). */
+  taperMin?: number;
+  /** Broken stroke: 0 continuous (default); toward 1 the tool lifts off in more and longer gaps. */
+  breaks?: number;
+  /**
+   * Size of the terminal heap relative to the usual (0-1.5, default 1). Below 1 the knife lifts
+   * cleanly and keeps the rest of its bead; above 1 it sheds more of its load at the tip.
+   */
+  heap?: number;
+  /** Strength of the knife's edge profile and nicks, which print as grooves along the stroke (0-1, default 1). */
+  edgeFlaws?: number;
 }
+
+/**
+ * Below this length (mm), a stroke's touch-down and lift-off shrink in proportion, so a short
+ * mark still lays paint instead of lifting away before it starts. Longer strokes are unaffected.
+ */
+export const FULL_LIFT_LENGTH = 24;
 
 export interface StrokeStats {
   lengthMm: number; steps: number;
@@ -145,6 +169,18 @@ function resample(points: Vec2[], ds: number) {
   return { xs, ys };
 }
 
+/**
+ * Length of tool face in contact with the paint, mm. A short mark is made with the tip, so below
+ * FULL_LIFT_LENGTH the contact shortens with the stroke (down to 35%).
+ */
+export const contactLength = (kind: ToolSpec['kind'], strokeMm = Infinity) =>
+  (kind === 'knife' ? 12 : 10) * (strokeMm < FULL_LIFT_LENGTH ? Math.max(0.35, strokeMm / FULL_LIFT_LENGTH) : 1);
+/**
+ * Load a node needs, mm^3, before paint yields and flows off it as a wet sheet. Below this the
+ * tool drags and only touches peaks. Planners should load well above it.
+ */
+export const yieldVolume = (kind: ToolSpec['kind'], pitch: number, strokeMm = Infinity) => pitch * contactLength(kind, strokeMm) * 0.3;
+
 let stampCounter = 1;
 const stamps = new Map<PaintCanvas, Int32Array>();
 const passStamps = new Map<PaintCanvas, Int32Array>();
@@ -180,11 +216,18 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
   const pickupFraction = knife ? 0.14 : 0.30;
   const swapRate = knife ? 0.92 : 0.8;
   const squeezeRate = knife ? 0.0022 : 0.0009;
-  const contactLen = knife ? 12 : 10;
+  const contactLen = contactLength(tool.spec.kind, L);
   const liftLen = Math.min(knife ? 3.5 : 6, L * 0.25);
+  // Touch-down and lift-off scale with the stroke below FULL_LIFT_LENGTH, so short marks deposit.
+  const lift = L < FULL_LIFT_LENGTH ? L / FULL_LIFT_LENGTH : 1;
+  const engage = clamp(stroke.engage ?? 1, 0.05, 1), taperHead = stroke.taper?.[0] ?? 0, taperTail = stroke.taper?.[1] ?? 0;
+  const taperMin = clamp(stroke.taperMin ?? 0.2, 0.02, 1), breaks = clamp(stroke.breaks ?? 0, 0, 1);
+  const flaws = clamp(stroke.edgeFlaws ?? 1, 0, 1);
   const sideBias = 0.5 + (hash(seed, 3, 91) - 0.5) * 0.56;
-  // Yield stress is a property of the paint, so this is an absolute load, not a share of the start.
-  const volThreshold = pitch * contactLen * 0.3;
+  // Yield stress is a property of the paint, so this is an absolute load, not a share of the start;
+  // only the contact patch shrinks for a short mark made with the tip.
+  const volThreshold = yieldVolume(tool.spec.kind, pitch, L);
+  const heapScale = clamp(stroke.heap ?? 1, 0, 1.5);
   const squeezeShare = knife ? 0.17 : 0.06;
   const press = stroke.pressMm ?? 0;
   const ringR = Math.max(2, Math.round(0.45 / dx));
@@ -192,8 +235,8 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
   const start = new Float64Array(N), end = new Float64Array(N), dumped = new Uint8Array(N);
   for (let i = 0; i < N; i++) {
     const q = (i + 0.5) * pitch;
-    start[i] = fbm1(q * 0.5, seed, 31) * (knife ? 1.2 : 3.0);
-    end[i] = L - fbm1(q * 0.3, seed, 32) * (knife ? 6.0 : 12.0) - noise1(q * 1.6, seed, 33) * (knife ? 2.0 : 4.0);
+    start[i] = fbm1(q * 0.5, seed, 31) * (knife ? 1.2 : 3.0) * lift;
+    end[i] = L - (fbm1(q * 0.3, seed, 32) * (knife ? 6.0 : 12.0) + noise1(q * 1.6, seed, 33) * (knife ? 2.0 : 4.0)) * lift;
   }
 
   let support = NaN, x1 = canvas.w, y1 = canvas.h, x2 = 0, y2 = 0;
@@ -222,8 +265,16 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
     // Each edge of the tool wanders, so the silhouette is never a clean ribbon.
     const wobL = (fbm1(s * 0.16, seed, 41) - 0.5) * (knife ? 0.09 : 0.14) + (noise1(s * 1.1, seed, 42) - 0.5) * 0.025;
     const wobR = (fbm1(s * 0.16, seed, 43) - 0.5) * (knife ? 0.09 : 0.14) + (noise1(s * 1.1, seed, 44) - 0.5) * 0.025;
-    const iL = Math.max(0, Math.floor((Math.max(0, wobL)) * N));
-    const iR = Math.min(N - 1, N - 1 - Math.floor((Math.max(0, wobR)) * N));
+    // Contact width: the engaged share of the blade, narrowed further toward tapered ends.
+    let contact = engage;
+    if (taperHead > 0 && s < taperHead * L) contact *= taperMin + (1 - taperMin) * smooth(s / (taperHead * L));
+    if (taperTail > 0 && s > L - taperTail * L) contact *= taperMin + (1 - taperMin) * smooth((L - s) / (taperTail * L));
+    const off = contact < 1 ? Math.floor((1 - contact) * 0.5 * N) : 0;
+    const iL = Math.max(off, Math.floor((Math.max(0, wobL)) * N));
+    const iR = Math.min(N - 1 - off, N - 1 - Math.floor((Math.max(0, wobR)) * N));
+    // A broken stroke skips where the blade rides up over the paint: ragged patches that vary
+    // across the blade as well as along it, never a clean cut.
+    const breaking = breaks > 0 && s > 1.5 && s < L - 1.5;
 
     // Blade support: the surface ahead of the edge, heavily smoothed for a stiff knife.
     let sum = 0;
@@ -270,7 +321,13 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
       const bed = lerp(support, blur[i], flex);
       const local = bed - Math.max(0, bed - 2.2) * (knife ? 0.55 : 0.4) - press;
       const wander = knife ? 0 : (noise2(i * 0.31, s * 0.09, seed) - 0.5) * 0.34;
-      const available = Math.min(gap + offset[i] + tool.nick[i] * nickGate * (0.1 + 0.9 * texture[i]) + wander, loadThickness * 0.75);
+      // The knife's edge profile (its fixed waviness and nicks) prints along the whole stroke as
+      // parallel grooves; edgeFlaws scales it. The blade's gentle camber stays.
+      const nickNow = tool.nick[i] * nickGate * (0.1 + 0.9 * texture[i]);
+      const camber = knife ? 0.05 * (1 - (2 * u) * (2 * u)) : 0;
+      const available = flaws === 1
+        ? Math.min(gap + offset[i] + nickNow + wander, loadThickness * 0.75)
+        : Math.min(gap + (camber + (offset[i] - camber) * flaws + nickNow * flaws) + wander, loadThickness * 0.75);
       z[i] = local + Math.max(0, available) + chatterBase * texture[i] + tilt * gap;
     }
 
@@ -311,6 +368,7 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
       const q = ex * nx + ey * ny, along = ex * tx + ey * ty;
       const f = clamp(q / W + 0.5, 0, 0.999999), i = Math.floor(f * N);
       if (i < iL || i > iR || s < start[i] || s > end[i]) continue;
+      if (breaking && noise2(q * 0.35 + 3, s * 0.42, seed + 34) + 0.45 * noise2(q * 1.4, s * 1.6, seed + 35) < 0.2 + breaks * 0.75) continue;
       stamp[c] = stampCounter;
       const X = ix * dx, Y = iy * dx;
       const fi = f * N - 0.5, i0 = fi < 0 ? 0 : Math.floor(fi), i1 = i0 + 1 < N ? i0 + 1 : i0, ft = fi < 0 ? 0 : fi - i0;
@@ -520,11 +578,21 @@ export function paintStroke(canvas: PaintCanvas, tool: Tool, stroke: StrokeSpec)
     }
 
     // Terminal heap: as each node lifts, its wave and part of its load drop ahead of the tip.
+    // A node a taper has already lifted off the paint sheds nothing; its bead went to the side.
     for (let i = 0; i < N; i++) {
       if (dumped[i] || s < end[i]) continue;
       dumped[i] = 1;
-      const shed = v[i] > volThreshold ? (knife ? 0.42 : 0.16) * (0.6 + 0.8 * hash(i, seed, 61)) : 0;
-      const fromLoad = Math.min(v[i] * shed, shedCap);
+      if (i < iL - 1 || i > iR + 1) continue;
+      // A clean lift keeps part of the bead on the knife instead of dropping it.
+      const keep = heapScale < 1 ? 1 - heapScale : 0;
+      if (keep > 0 && wv[i] > 0) {
+        const kv = wv[i] * keep;
+        for (let k = 0; k < 3; k++) { const m = wp[i * 3 + k] * keep; wp[i * 3 + k] -= m; p[i * 3 + k] += m; }
+        wv[i] -= kv; v[i] += kv;
+      }
+      // A short mark sheds in proportion to its length; `heap` scales it further.
+      const shed = v[i] > volThreshold ? Math.min(0.9, (knife ? 0.42 : 0.16) * (0.6 + 0.8 * hash(i, seed, 61)) * lift * heapScale) : 0;
+      const fromLoad = Math.min(v[i] * shed, shedCap * lift * (heapScale > 1 ? heapScale : 1));
       const frac = v[i] > 0 ? fromLoad / v[i] : 0;
       const vol = wv[i] + fromLoad;
       if (vol <= 1e-9) continue;

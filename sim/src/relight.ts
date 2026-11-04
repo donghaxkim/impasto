@@ -14,7 +14,37 @@ export interface LightSettings {
   exposure: number;
   /** Strength of the display glow around the brightest highlights. 0 turns it off. */
   glow: number;
+  /** Surface look (see LOOKS). Defaults to 'locked', the reference look. */
+  look?: LookName;
 }
+
+/**
+ * Surface look. 'locked' is the reference: glossy wet paint, pin-prick crest glints, deep cavities.
+ * 'oil' is semi-gloss and calmer: rougher coat, highlights filtered by how fast the normal turns
+ * within a pixel (Kaplanyan's geometric specular anti-aliasing) so crests carry continuous sheens
+ * instead of beads, weaker crest boost and second window, gentler cavities.
+ */
+export interface LookParams {
+  /** Floor on clearcoat roughness. */
+  coatMin: number;
+  /** Micro-facet jitter on curved paint (1 = reference pin-pricks). */
+  micro: number;
+  /** Extra specular on convex crests above a recess. */
+  crestBoost: number;
+  /** Strength of the second, softer highlight window. */
+  window2: number;
+  /** Overall clearcoat strength. */
+  specGain: number;
+  /** Weight of geometric specular anti-aliasing (0 = off). */
+  specAA: number;
+  /** How much cavities cut the key and the fill light, and deepen colour. */
+  cavityKey: number; cavityFill: number; richness: number;
+}
+export type LookName = 'locked' | 'oil';
+export const LOOKS: Record<LookName, LookParams> = {
+  locked: { coatMin: 0, micro: 1, crestBoost: 2.5, window2: 0.55, specGain: 1, specAA: 0, cavityKey: 0.6, cavityFill: 0.72, richness: 0.35 },
+  oil: { coatMin: 0.2, micro: 0.25, crestBoost: 0.8, window2: 0.25, specGain: 0.7, specAA: 1, cavityKey: 0.35, cavityFill: 0.45, richness: 0.22 },
+};
 export const DEFAULT_LIGHT: LightSettings = { azimuth: 225, elevation: 30, occlusion: 0.8, relief: 1, exposure: 1, glow: 1 };
 
 /**
@@ -125,6 +155,7 @@ export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, vi
     out[i * 3] = linearToSrgb(r) * 255 + 0.5; out[i * 3 + 1] = linearToSrgb(g) * 255 + 0.5; out[i * 3 + 2] = linearToSrgb(b) * 255 + 0.5;
   };
   const expo = light.exposure;
+  const look = LOOKS[light.look ?? 'locked'];
 
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const i = y * w + x, s = S[i];
@@ -207,12 +238,12 @@ export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, vi
     const keyGain = 0.72 * (1 + wrap) / (se + wrap);
     // Broad fill stays soft on open paint and falls away inside cavities.
     const open = 1 - cavity;
-    const fill = 0.14 * ambient * (0.65 + 0.35 * nz) * (1 - 0.72 * cavity);
+    const fill = 0.14 * ambient * (0.65 + 0.35 * nz) * (1 - look.cavityFill * cavity);
     // Soft bounce from the side opposite the lamp. Lips that face away pick up colour here and
     // read as turning form, where they used to read as drawn lines. It casts no shadow.
     const bounceN = -lx * nx * 0.82 / cel - ly * ny * 0.82 / cel + 0.57 * nz;
     const bounce = (bounceN > 0 ? bounceN : 0) * 0.17 * open * open;
-    const key = diffuse * keyGain * visibility * (0.7 + 0.3 * ambient) * (1 - 0.6 * cavity);
+    const key = diffuse * keyGain * visibility * (0.7 + 0.3 * ambient) * (1 - look.cavityKey * cavity);
     // Light bouncing between paint walls keeps crevices coloured, not black.
     // A small floor inside cavities leaves them a rich, dark colour, never pure black.
     const lit = fill + key + bounce + 0.14 * (1 - ambient) * open + 0.05 * cavity;
@@ -224,10 +255,12 @@ export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, vi
       const xp = x + 1 < w ? i + 1 : i, xm = x > 0 ? i - 1 : i, yp = y + 1 < h ? i + w : i, ym = y > 0 ? i - w : i;
       const dg1 = GX[xp] - GX[xm], dg2 = GX[yp] - GX[ym], dg3 = GY[xp] - GY[xm], dg4 = GY[yp] - GY[ym];
       const changeSq = dg1 * dg1 + dg2 * dg2 + dg3 * dg3 + dg4 * dg4, change = Math.sqrt(changeSq);
-      const coat = clearcoatRoughness(c.rough[i], change, x, y);
+      const coat0 = clearcoatRoughness(c.rough[i], change, x, y), coat = coat0 > look.coatMin ? coat0 : look.coatMin;
       // A pixel covers a small range of normals. This keeps narrow lobes from vanishing between
-      // pixels. The cap is low so the highlight stays a sharp point.
-      const pixelVariance = Math.min(0.0009, changeSq * nz * nz * nz * nz * 0.004);
+      // pixels. The cap is low so the highlight stays a sharp point. Geometric specular AA adds the
+      // normal's spread across the pixel to the lobe (sigma^2 = 1 / 2pi, kappa = 0.18).
+      const nz4 = nz * nz * nz * nz;
+      const aa = changeSq * 0.25 * nz4 * 0.3183098861837907 * 2, pixelVariance = Math.min(0.0009, changeSq * nz4 * 0.004) + look.specAA * (aa < 0.18 ? aa : 0.18);
       const lobe = (rough: number, noH: number, nDotL: number, f: number) => {
         const alpha = rough * rough, a2 = alpha * alpha + pixelVariance;
         const den = noH * noH * (a2 - 1) + 1;
@@ -238,12 +271,12 @@ export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, vi
       };
       // Curved paint is not perfectly smooth. Four micro-facets per pixel, each tilted a little,
       // break a highlight along a crest into separate points. Flat faces take one smooth sample.
-      const curved = smooth((change - 0.15) / 0.5);
+      const curved = smooth((change - 0.15) / 0.5), jitter = 0.5 * curved * look.micro;
       const irradiance = 0.72 / se * 3.141592653589793;
       const facets = (qx: number, qy: number, qz: number, nDotL: number, f: number) => {
         let sum = 0;
         for (let m = 0; m < 4; m++) {
-          const jx = gx + (hash(x, y, 23 + m * 2) - 0.5) * 0.5 * curved, jy = gy + (hash(x, y, 24 + m * 2) - 0.5) * 0.5 * curved;
+          const jx = gx + (hash(x, y, 23 + m * 2) - 0.5) * jitter, jy = gy + (hash(x, y, 24 + m * 2) - 0.5) * jitter;
           const jl = Math.sqrt(jx * jx + jy * jy + 1);
           sum += lobe(coat, Math.max(0, (-jx * qx - jy * qy + qz) / jl), nDotL, f);
         }
@@ -254,18 +287,19 @@ export function relight(c: PaintCanvas, light: LightSettings = DEFAULT_LIGHT, vi
         const sharp = curved > 0 ? facets(hx, hy, hz, noL, fresnel) : lobe(coat, smoothNoH, noL, fresnel);
         spec += (sharp * irradiance + lobe(0.30, smoothNoH, noL, fresnel) * irradiance * 0.05) * visibility;
       }
-      if (curved > 0 && noL2 > 0) spec += facets(hx2, hy2, hz2, noL2, fresnel2) * irradiance * 0.55 * (0.6 + 0.4 * visibility);
+      if (curved > 0 && noL2 > 0) spec += facets(hx2, hy2, hz2, noL2, fresnel2) * irradiance * look.window2 * (0.6 + 0.4 * visibility);
       // Crest boost: convex paint standing above a recess flashes hardest. Spec stays unclipped here.
       if (curved > 0 && spec > 0) {
         const r2 = 2;
         const lap = (at(x + r2, y) + at(x - r2, y) + at(x, y + r2) + at(x, y - r2) - 4 * s) / (4 * dx * dx);
         const crest = curved * smooth(-lap / 3) * smooth((deepest - 0.3) / 1.1);
-        spec *= 1 + 2.5 * crest;
+        spec *= 1 + look.crestBoost * crest;
       }
+      spec *= look.specGain;
     }
     // Weak sky reflection at grazing normals keeps deep shadows from going dead black.
     // Light that reaches a crevice has bounced off pigment on the way, so its colour deepens.
-    const richness = 0.35 * cavity;
+    const richness = look.richness * cavity;
     const rich = (a: number) => a * (1 - richness + a * richness);
     const fv = 1 - nz, env = (0.02 + 0.2 * fv * fv) * ambient * 0.22;
     if (view === 'spec') { encode(i, spec, spec, spec); continue; }

@@ -2,8 +2,21 @@
  * WebGPU port of src/relight.ts for live light control. The CPU version is the reference.
  * Two passes: `fs` writes base colour and unclipped specular, `composite` adds the glow.
  */
+import { LOOKS, type LightSettings } from './relight.ts';
+
+/**
+ * Uniform block for RELIGHT_WGSL (24 floats). Keep in the order of the WGSL Params struct.
+ * `view` is 0 paint, 1 colour, 2 height, 3 normal, 4 highlights, 5 cavities, 6 glow.
+ */
+export function relightUniforms(w: number, h: number, dx: number, maxH: number, light: LightSettings, view: number): Float32Array {
+  const k = LOOKS[light.look ?? 'locked'];
+  return new Float32Array([w, h, dx, light.relief, light.azimuth, light.elevation, light.occlusion, light.exposure, maxH, view, light.glow, 0,
+    k.coatMin, k.micro, k.crestBoost, k.window2, k.specGain, k.specAA, k.cavityKey, k.cavityFill, k.richness, 0, 0, 0]);
+}
+
 export const RELIGHT_WGSL = /* wgsl */ `
-struct Params { size: vec2<f32>, dx: f32, relief: f32, azimuth: f32, elevation: f32, occlusion: f32, exposure: f32, maxH: f32, view: f32, glow: f32, pad: f32 };
+struct Params { size: vec2<f32>, dx: f32, relief: f32, azimuth: f32, elevation: f32, occlusion: f32, exposure: f32, maxH: f32, view: f32, glow: f32, pad: f32,
+  coatMin: f32, micro: f32, crestBoost: f32, window2: f32, specGain: f32, specAA: f32, cavityKey: f32, cavityFill: f32, richness: f32, pad1: f32, pad2: f32, pad3: f32 };
 @group(0) @binding(0) var heightTex: texture_2d<f32>;
 @group(0) @binding(1) var colorTex: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> u: Params;
@@ -136,7 +149,7 @@ fn lobe(rough: f32, variance: f32, noH: f32, noL: f32, nz: f32, fresnel: f32) ->
   let keyGain = 0.72 * (1.0 + wrap) / (se + wrap);
   let diffuse = clamp((noL + wrap) / (1.0 + wrap), 0.0, 1.0);
   let bounceN = -L.x * N.x * 0.82 / cel - L.y * N.y * 0.82 / cel + 0.57 * N.z;
-  let lit = 0.14 * ambient * (0.65 + 0.35 * N.z) * (1.0 - 0.72 * cavity) + diffuse * keyGain * visibility * (0.7 + 0.3 * ambient) * (1.0 - 0.6 * cavity) + max(bounceN, 0.0) * 0.17 * open * open + 0.14 * (1.0 - ambient) * open + 0.05 * cavity;
+  let lit = 0.14 * ambient * (0.65 + 0.35 * N.z) * (1.0 - u.cavityFill * cavity) + diffuse * keyGain * visibility * (0.7 + 0.3 * ambient) * (1.0 - u.cavityKey * cavity) + max(bounceN, 0.0) * 0.17 * open * open + 0.14 * (1.0 - ambient) * open + 0.05 * cavity;
   var spec = 0.0;
   let az2 = radians(u.azimuth + 70.0); let el2 = radians(min(u.elevation + 14.0, 75.0));
   let L2 = vec3<f32>(cos(az2) * cos(el2), sin(az2) * cos(el2), sin(el2));
@@ -151,35 +164,37 @@ fn lobe(rough: f32, variance: f32, noH: f32, noL: f32, nz: f32, fresnel: f32) ->
     let changeSq = dot(d1, d1) + dot(d2, d2);
     let curved = smooth01((sqrt(changeSq) - 0.15) / 0.5);
     let z2 = N.z * N.z;
-    let variance = min(0.0009, changeSq * z2 * z2 * 0.004);
+    let aa = changeSq * 0.25 * z2 * z2 * 0.3183098861837907 * 2.0;
+    let variance = min(0.0009, changeSq * z2 * z2 * 0.004) + u.specAA * min(aa, 0.18);
     let irradiance = 0.72 / se * 3.14159265;
     let micro = 0.03 + 0.05 * hash(x, y, 17);
-    let rough = coat + (micro - coat) * curved * (1.0 - smooth01((coat - 0.2) / 0.1));
+    let rough = max(coat + (micro - coat) * curved * (1.0 - smooth01((coat - 0.2) / 0.1)), u.coatMin);
     var sharp1 = 0.0; var sharp2 = 0.0;
     if (curved > 0.0) {
       for (var m = 0; m < 4; m += 1) {
-        let jx = g.x + (hash(x, y, 23 + m * 2) - 0.5) * 0.5 * curved;
-        let jy = g.y + (hash(x, y, 24 + m * 2) - 0.5) * 0.5 * curved;
+        let jx = g.x + (hash(x, y, 23 + m * 2) - 0.5) * 0.5 * curved * u.micro;
+        let jy = g.y + (hash(x, y, 24 + m * 2) - 0.5) * 0.5 * curved * u.micro;
         let jl = sqrt(jx * jx + jy * jy + 1.0);
         if (noL > 0.0) { sharp1 += lobe(rough, variance, max(0.0, (-jx * H.x - jy * H.y + H.z) / jl), noL, N.z, fresnel); }
         if (noL2 > 0.0) { sharp2 += lobe(rough, variance, max(0.0, (-jx * H2.x - jy * H2.y + H2.z) / jl), noL2, N.z, fresnel2); }
       }
       sharp1 *= 0.25; sharp2 *= 0.25;
     } else if (noL > 0.0) {
-      sharp1 = lobe(coat, variance, smoothNoH, noL, N.z, fresnel);
+      sharp1 = lobe(max(coat, u.coatMin), variance, smoothNoH, noL, N.z, fresnel);
     }
     if (noL > 0.0) { spec += (sharp1 + lobe(0.30, variance, smoothNoH, noL, N.z, fresnel) * 0.05) * irradiance * visibility; }
-    if (curved > 0.0 && noL2 > 0.0) { spec += sharp2 * irradiance * 0.55 * (0.6 + 0.4 * visibility); }
+    if (curved > 0.0 && noL2 > 0.0) { spec += sharp2 * irradiance * u.window2 * (0.6 + 0.4 * visibility); }
     if (curved > 0.0 && spec > 0.0) {
       let lap = (at(x + 2, y) + at(x - 2, y) + at(x, y + 2) + at(x, y - 2) - 4.0 * s) / (4.0 * u.dx * u.dx);
       let crest = curved * smooth01(-lap / 3.0) * smooth01((deepest - 0.3) / 1.1);
-      spec *= 1.0 + 2.5 * crest;
+      spec *= 1.0 + u.crestBoost * crest;
     }
+    spec *= u.specGain;
   }
   let fv = 1.0 - N.z;
   let env = (0.02 + 0.2 * fv * fv) * ambient * 0.22;
   if (u.view > 3.5 && u.view < 4.5) { let v = encode(spec); return vec4<f32>(v, v, v, 1.0); }
-  let richness = 0.35 * cavity;
+  let richness = u.richness * cavity;
   let deep = albedo * (vec3<f32>(1.0 - richness) + albedo * richness);
   return vec4<f32>(deep.r * lit + env, deep.g * lit + env * 0.985, deep.b * lit + env * 0.95, spec);
 }
