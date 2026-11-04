@@ -10,6 +10,7 @@
     "paint": "node --experimental-strip-types --no-warnings --max-old-space-size=6000 tests/paint-image.ts",
     "forms": "node --experimental-strip-types --no-warnings tests/forms-image.ts",
     "diagnose": "node --experimental-strip-types --no-warnings --max-old-space-size=6000 tests/diagnose.ts",
+    "test:viewer": "node --experimental-strip-types --no-warnings --test --test-concurrency=1 tests/viewer.browser.ts",
     "gpu-parity": "node --experimental-strip-types --no-warnings tests/gpu-parity.ts"
   }
 }
