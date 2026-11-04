@@ -146,7 +146,7 @@ test('api: oil render gives RGBA, a matching surface and monotonic progress', as
   assert.equal(r.surface.color.length, r.surface.w * r.surface.h * 4);
   assert.ok(r.surface.maxH > 0.1, `maxH ${r.surface.maxH}`);
   assert.ok(r.strokes > 10, `${r.strokes} strokes`);
-  assert.deepEqual(r.light, { ...DEFAULT_LIGHT, look: 'oil' });
+  assert.deepEqual(r.light, resolvePreset('oil').light);
   assert.deepEqual(Object.keys(r.timings).sort(), ['analyse', 'paint', 'plan', 'relight', 'snapshot', 'surface', 'total']);
   assert.equal(r.timings.snapshot, 0, 'no snapshots without onLayer');
 });
