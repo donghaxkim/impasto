@@ -9,7 +9,7 @@
  * `npm install` has been run in this folder. With --prepare and no TypeScript, an existing dist/ is
  * kept; without one the install stops with instructions instead of a bare "tsc: not found".
  */
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, renameSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +27,11 @@ if (!tsc) {
   console.error(`impasto-sim: dist/ needs building and TypeScript is not installed in ${root}.\n  Run \`npm install\` in ${root} once (it builds dist/), then install again.`);
   process.exit(1);
 }
+// Build into a fresh folder and swap it in only on success, so a failed build leaves the last
+// good dist/ in place (and drops nothing stale into it).
+const next = `${root}dist.next`;
+rmSync(next, { recursive: true, force: true });
+const r = spawnSync(process.execPath, [tsc, '-p', 'tsconfig.build.json', '--outDir', next], { cwd: root, stdio: 'inherit' });
+if (r.status !== 0) { rmSync(next, { recursive: true, force: true }); process.exit(r.status ?? 1); }
 rmSync(`${root}dist`, { recursive: true, force: true });
-const r = spawnSync(process.execPath, [tsc, '-p', 'tsconfig.build.json'], { cwd: root, stdio: 'inherit' });
-process.exit(r.status ?? 1);
+renameSync(next, `${root}dist`);
