@@ -190,7 +190,7 @@ viewer.destroy();
 
 ### `.impasto` files
 
-`encodeSurface(s, opts?)` / `decodeSurface(bytes)` in `surface.ts`, so a site can ship prerendered paintings. `encodeSurface` writes version 2 (quantised) unless given `{ version: 1 }` (lossless); `decodeSurface` reads both and throws a clear error on a wrong magic, gzip data, an unknown version or flag, a truncated or oversized file, or corrupt header ranges. The same surface always gives the same bytes, and decoding gives the same floats on every engine (plain arithmetic and table lookups, no `Math.pow`).
+`encodeSurface(s, opts?)` / `decodeSurface(bytes, { maxCells? })` in `surface.ts`, so a site can ship prerendered paintings. `encodeSurface` writes version 2 (quantised) unless given `{ version: 1 }` (lossless); `decodeSurface` reads both and throws a clear error on a wrong magic, gzip data, an unknown version or flag, a truncated or oversized file, or corrupt header ranges. Files may come from the network, so decoding also refuses a cell size outside `SURFACE_DX_MIN`..`SURFACE_DX_MAX` (0.001 to 100 mm; the occlusion filter and the renderers' loops scale with 1/dx, so a hostile tiny dx would hang the tab) and more than `maxCells` cells (default `SURFACE_MAX_CELLS`, 32M) before allocating anything; the viewer rejects the same dx range. The same surface always gives the same bytes, and decoding gives the same floats on every engine (plain arithmetic and table lookups, no `Math.pow`).
 
 All versions are little-endian and share the first 48 bytes: 8-byte magic `IMPASTO\x1a`, u32 version, u32 header size (data starts there, so a version can grow its header), u32 w, u32 h, u32 flags, u32 reserved, f64 dx, f64 maxH.
 

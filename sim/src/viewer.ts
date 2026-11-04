@@ -17,7 +17,7 @@ import { DEFAULT_LIGHT, LOOKS, type LightSettings, type LookName, type View } fr
 import { RELIGHT_WGSL, relightUniforms } from './relight-gpu.ts';
 import { GlRelight, initWebGl2 } from './relight-gl.ts';
 import { linearToSrgb } from './pigment.ts';
-import type { ImpastoSurface } from './surface.ts';
+import { SURFACE_DX_MAX, SURFACE_DX_MIN, type ImpastoSurface } from './surface.ts';
 
 export type ViewerMode = 'webgpu' | 'webgl2' | 'static';
 /** A way of drawing, in the order `createImpastoViewer` tries them by default. */
@@ -117,6 +117,8 @@ function checkSurface(s: ImpastoSurface): void {
   const n = s.w * s.h;
   if (!(n > 0) || !Number.isInteger(s.w) || !Number.isInteger(s.h)) throw new TypeError(`ImpastoSurface: bad size ${s.w}x${s.h}`);
   if (s.height.length !== n * 2 || s.color.length !== n * 4) throw new TypeError(`ImpastoSurface: height needs ${n * 2} floats and color ${n * 4} for ${s.w}x${s.h}`);
+  // The glow and shadow loops scale with 1/dx: a tiny dx from a corrupt file would hang the GPU.
+  if (!(s.dx >= SURFACE_DX_MIN && s.dx <= SURFACE_DX_MAX)) throw new TypeError(`ImpastoSurface: bad dx ${s.dx} (must be ${SURFACE_DX_MIN} to ${SURFACE_DX_MAX} mm)`);
 }
 
 /** Creates the WebGPU pipeline, or explains why it can't. */
@@ -131,9 +133,9 @@ async function initGpu(gpu: GPU | null | undefined, canvas: HTMLCanvasElement, s
   // Ask for the adapter's full texture size: the default device limit is 8192 whatever the GPU supports.
   try { device = await adapter.requestDevice({ requiredLimits: { maxTextureDimension2D: maxDim } }); } catch (e) { return `requestDevice failed: ${(e as Error).message}`; }
   const fail = (why: string) => { device.destroy(); return why; };
-  webgpuCanvases.add(canvas);
   const context = canvas.getContext('webgpu');
-  if (!context) return fail('the canvas has no WebGPU context (it may already hold a 2D one)');
+  if (!context) return fail('the canvas has no WebGPU context (it may already hold a 2D or WebGL one)');
+  webgpuCanvases.add(canvas);
   try {
     device.pushErrorScope('out-of-memory');
     device.pushErrorScope('validation');
@@ -439,6 +441,7 @@ class Viewer extends EventTarget implements ImpastoViewer {
     if (g) { for (const t of g.textures) t.destroy(); g.uniforms.destroy(); g.device.destroy(); }
     const gl = this.#gl;
     this.#gl = null;
+    if (this.#glLost) { this.canvas.removeEventListener('webglcontextlost', this.#glLost); this.#glLost = null; }
     if (gl && !gl.gl.isContextLost()) gl.dispose();
   }
 }

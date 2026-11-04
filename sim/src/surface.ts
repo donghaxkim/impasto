@@ -77,6 +77,17 @@ export const SURFACE_VERSION = 2;
 const V1_HEADER_BYTES = 48, V2_HEADER_BYTES = 96;
 /** Flag bit (version 2): the occlusion channel is stored rather than rebuilt from the visible height. */
 export const SURFACE_FLAG_OCCLUSION = 1;
+/** Plausible cell sizes in mm. Outside this a header is corrupt or hostile: renderers and the occlusion filter scale with 1/dx. */
+export const SURFACE_DX_MIN = 1e-3;
+export const SURFACE_DX_MAX = 100;
+/** Default `maxCells` for `decodeSurface`: 32M cells (e.g. 640 x 500 mm at 0.1 mm). A decoded surface keeps 24 bytes per cell. */
+export const SURFACE_MAX_CELLS = 32_000_000;
+const plausibleDx = (dx: number): boolean => dx >= SURFACE_DX_MIN && dx <= SURFACE_DX_MAX;
+
+export interface DecodeSurfaceOptions {
+  /** Reject surfaces with more cells than this before allocating anything (default SURFACE_MAX_CELLS). */
+  maxCells?: number;
+}
 
 export interface EncodeSurfaceOptions {
   /**
@@ -175,7 +186,7 @@ export function encodeSurface(s: ImpastoSurface, opts: EncodeSurfaceOptions = {}
   if (!(Number.isInteger(s.w) && Number.isInteger(s.h) && s.w > 0 && s.h > 0 && s.w <= 0xffffffff && s.h <= 0xffffffff)) throw new Error(`encodeSurface: bad size ${s.w}x${s.h}`);
   const n = s.w * s.h;
   if (s.height.length !== n * 2 || s.color.length !== n * 4) throw new Error(`encodeSurface: buffers do not match ${s.w}x${s.h}`);
-  if (!(s.dx > 0 && Number.isFinite(s.dx)) || !Number.isFinite(s.maxH)) throw new Error(`encodeSurface: bad dx ${s.dx} or maxH ${s.maxH}`);
+  if (!plausibleDx(s.dx) || !Number.isFinite(s.maxH)) throw new Error(`encodeSurface: bad dx ${s.dx} (must be ${SURFACE_DX_MIN} to ${SURFACE_DX_MAX} mm) or maxH ${s.maxH}`);
   if (version === 1) {
     const bytes = new Uint8Array(V1_HEADER_BYTES + n * 24);
     const view = new DataView(bytes.buffer);
@@ -224,7 +235,8 @@ function heightChannel(height: Float32Array, k: number, n: number): Float32Array
  * Parses an `.impasto` file, version 1 or 2. Throws with a readable message on anything it does
  * not recognise: wrong magic, gzip data, unknown version or flags, or a size that does not match.
  */
-export function decodeSurface(bytes: Uint8Array | ArrayBuffer): ImpastoSurface {
+export function decodeSurface(bytes: Uint8Array | ArrayBuffer, opts: DecodeSurfaceOptions = {}): ImpastoSurface {
+  const maxCells = opts.maxCells ?? SURFACE_MAX_CELLS;
   const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
   if (b.length < 16 || SURFACE_MAGIC.some((m, i) => b[i] !== m)) {
     throw new Error(b[0] === 0x1f && b[1] === 0x8b ? 'decodeSurface: data is gzip-compressed; decompress it first' : 'decodeSurface: not an .impasto surface (bad magic)');
@@ -237,8 +249,9 @@ export function decodeSurface(bytes: Uint8Array | ArrayBuffer): ImpastoSurface {
   if (b.length < header) throw new Error(`decodeSurface: truncated header (${b.length} of ${header} bytes)`);
   const w = view.getUint32(16, true), h = view.getUint32(20, true), n = w * h, flags = view.getUint32(24, true);
   if (!w || !h) throw new Error(`decodeSurface: bad size ${w}x${h}`);
+  if (n > maxCells) throw new Error(`decodeSurface: ${w}x${h} is ${n} cells, more than maxCells ${maxCells}`);
   const dx = view.getFloat64(32, true), maxH = view.getFloat64(40, true);
-  if (!(dx > 0 && Number.isFinite(dx)) || !Number.isFinite(maxH)) throw new Error(`decodeSurface: bad dx ${dx} or maxH ${maxH}`);
+  if (!plausibleDx(dx) || !Number.isFinite(maxH)) throw new Error(`decodeSurface: bad dx ${dx} (must be ${SURFACE_DX_MIN} to ${SURFACE_DX_MAX} mm) or maxH ${maxH}`);
   const known = version === 1 ? 0 : SURFACE_FLAG_OCCLUSION;
   if (flags & ~known) throw new Error(`decodeSurface: unknown flags 0x${flags.toString(16)} for version ${version}`);
   const storeOcc = (flags & SURFACE_FLAG_OCCLUSION) !== 0;
@@ -250,7 +263,7 @@ export function decodeSurface(bytes: Uint8Array | ArrayBuffer): ImpastoSurface {
 
   const ranges = [48, 56, 64, 72, 80, 88].map((o) => view.getFloat64(o, true));
   const [h0, h1, o0, o1, r0, r1] = ranges;
-  if (ranges.some((v) => !Number.isFinite(v)) || h1 < h0 || o1 < o0 || r1 < r0) throw new Error('decodeSurface: corrupt value ranges in the header');
+  if (ranges.some((v) => !Number.isFinite(v)) || h1 < h0 || o1 < o0 || r1 < r0 || ![h1 - h0, o1 - o0, r1 - r0].every(Number.isFinite)) throw new Error('decodeSurface: corrupt value ranges in the header');
   const height = new Float32Array(n * 2), color = new Float32Array(n * 4);
   let at = header;
   const hq = readPlane16(b, at, w, n), hs = (h1 - h0) / 65535; at += n * 2;

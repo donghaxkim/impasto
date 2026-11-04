@@ -477,7 +477,10 @@ export async function initWebGl2(canvas: HTMLCanvasElement, s: { w: number; h: n
     // background, wait without blocking the page. Otherwise reading LINK_STATUS blocks until done.
     const parallel = ext<{ COMPLETION_STATUS_KHR: number }>('KHR_parallel_shader_compile');
     if (parallel) {
-      while (!pending.every((q) => ctx.getProgramParameter(q.p, parallel.COMPLETION_STATUS_KHR))) await new Promise((ok) => setTimeout(ok, 8));
+      while (!pending.every((q) => ctx.getProgramParameter(q.p, parallel.COMPLETION_STATUS_KHR))) {
+        if (ctx.isContextLost()) return fail('the WebGL2 context was lost while compiling shaders');
+        await new Promise((ok) => setTimeout(ok, 8));
+      }
     }
     for (const q of pending) { const err = finishProgram(ctx, q); if (err) return fail(err); }
     const [fs, out] = pending.map((q) => q.p);

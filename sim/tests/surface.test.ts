@@ -219,7 +219,11 @@ test('decodeSurface rejects bad input with a clear message', () => {
     assert.throws(() => decodeSurface(longer), /expected/);
     assert.throws(() => decodeSurface(patch(b, (v) => v.setUint32(8, 3, true))), /unsupported version 3/);
     assert.throws(() => decodeSurface(patch(b, (v) => v.setUint32(16, 0, true))), /bad size/);
-    assert.throws(() => decodeSurface(patch(b, (v) => v.setUint32(20, 1 << 30, true))), /expected/);
+    assert.throws(() => decodeSurface(patch(b, (v) => v.setUint32(20, 1 << 30, true))), /maxCells/);
+    assert.throws(() => decodeSurface(patch(b, (v) => v.setUint32(20, 1 << 30, true)), { maxCells: Infinity }), /expected/);
+    assert.throws(() => decodeSurface(b, { maxCells: 2 }), /more than maxCells 2/);
+    // A tiny or huge dx would make the occlusion filter and renderers loop ~1/dx times (a hostile file could hang the tab).
+    for (const dx of [5e-324, 1e-9, 9e-4, 101]) assert.throws(() => decodeSurface(patch(b, (v) => v.setFloat64(32, dx, true))), /bad dx/);
     assert.throws(() => decodeSurface(patch(b, (v) => v.setFloat64(32, NaN, true))), /bad dx/);
     assert.throws(() => decodeSurface(patch(b, (v) => v.setUint32(24, 4, true))), /unknown flags/);
   }
@@ -228,6 +232,8 @@ test('decodeSurface rejects bad input with a clear message', () => {
   // A v2 file claiming a stored occlusion channel it does not have.
   assert.throws(() => decodeSurface(patch(b2, (v) => v.setUint32(24, 1, true))), /expected/);
   assert.throws(() => decodeSurface(patch(b2, (v) => v.setFloat64(56, NaN, true))), /corrupt value ranges/);
+  // Finite bounds whose span overflows would decode to NaN heights.
+  assert.throws(() => decodeSurface(patch(b2, (v) => { v.setFloat64(48, -1.7e308, true); v.setFloat64(56, 1.7e308, true); })), /corrupt value ranges/);
   assert.throws(() => decodeSurface(patch(b2, (v) => { v.setFloat64(80, 1, true); v.setFloat64(88, 0, true); })), /corrupt value ranges/);
   // A larger header than this build knows is skipped (later versions can grow it).
   const grown = new Uint8Array(b2.length + 8); grown.set(b2.subarray(0, 96)); grown.set(b2.subarray(96), 104);
@@ -240,6 +246,7 @@ test('encodeSurface rejects surfaces it cannot write', () => {
   assert.throws(() => encodeSurface({ w: 2, h: 2, dx: 0.1, maxH: 0, height: new Float32Array(3), color: new Float32Array(16) }), /do not match/);
   assert.throws(() => encodeSurface({ ...s, w: 0 }), /bad size/);
   assert.throws(() => encodeSurface({ ...s, dx: 0 }), /bad dx/);
+  assert.throws(() => encodeSurface({ ...s, dx: 1e-9 }), /bad dx/);
   assert.throws(() => encodeSurface(s, { version: 3 as 2 }), /unsupported version 3/);
   const nan = { ...s, height: s.height.slice() }; nan.height[5] = NaN;
   assert.throws(() => encodeSurface(nan), /height is not finite at cell 2/);
