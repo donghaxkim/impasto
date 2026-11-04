@@ -340,6 +340,8 @@ const PROFILE = 5;
 const SHADE_MIN_MM = 4, SHADE_GRAD = 0.004;
 /** Shading cue above which a shape is split into value bands for presses. */
 const BAND_CUE = 0.3;
+/** Share of a shape on a strong shading cue for it to be pressed as planes (see planPresses). */
+const PLANE_SHARE = 0.1;
 /** A warm dark (burnt-sienna-like, OKLab) that the underpainting is toned toward. */
 const UNDER_TONE = [0.42, 0.05, 0.07];
 
@@ -686,8 +688,13 @@ export class Planner {
     const hold = this.s.pressRestraint > 0 ? (this.pressHold = new Float64Array(n)) : null;
     for (const lb of [...members.keys()].sort((a, b) => a - b)) {
       const cells = members.get(lb)!;
-      // With value bands, a large shape (a whole face) gets enough presses to cover it, not just 32.
-      const maxTries = planeRef ? Math.max(32, Math.ceil(cells.length / (W0 * W0))) : 32;
+      // A shape with a real share of smooth, shaded form (a face, not a lake or a facade) is pressed
+      // as planes: enough presses to cover it (a whole face is one shape), not just 32, but each at
+      // least half as wide as the widest already in it.
+      let smoothCells = 0;
+      if (planeRef) for (const i of cells) if (shade!.data[i * 4 + 2] >= BAND_CUE) smoothCells++;
+      const planes = smoothCells >= PLANE_SHARE * cells.length;
+      const maxTries = planes ? Math.max(32, Math.ceil(cells.length / (W0 * W0))) : 32;
       let widest = 0;
       for (let tries = 0; tries < maxTries; tries++) {
         let best = -1, bc = -1;
@@ -708,9 +715,8 @@ export class Planner {
           if (q === 0 || across(R, x0, y0, sizes[q] / cell, c) <= L.tolerance) z = q;
         }
         if (z < 0) break;
-        // With value bands, later presses in a shape stay comparable to its widest: the slivers
-        // between planes are left to the forms layer rather than filled with small presses.
-        if (planeRef && sizes[z] < 0.5 * widest) { const fp0 = this.footprint([x0, y0, x0 + d[0], y0 + d[1]], sizes[z] / cell); for (const i of fp0) covered[i] = 1; continue; }
+        // The slivers between planes are left to the forms layer rather than filled with small presses.
+        if (planes && sizes[z] < 0.5 * widest) { const fp0 = this.footprint([x0, y0, x0 + d[0], y0 + d[1]], sizes[z] / cell); for (const i of fp0) covered[i] = 1; continue; }
         const W = sizes[z] / cell, h = W * STEP, R = refOf(z);
         if (smoothForm) col = [sampleE(R, x0, y0, 0), sampleE(R, x0, y0, 1), sampleE(R, x0, y0, 2)];
         st.seeds++;
