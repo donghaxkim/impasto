@@ -5,8 +5,8 @@
   "scripts": {
     "render": "node --experimental-strip-types --no-warnings tests/render.ts",
     "viewer": "node --experimental-strip-types --no-warnings tests/export-viewer.ts",
-    "test": "node --experimental-strip-types --no-warnings --test tests/sim.test.ts tests/primitives.test.ts tests/planner.test.ts",
-    "test:planner": "node --experimental-strip-types --no-warnings --test tests/planner.test.ts",
+    "test": "node --experimental-strip-types --no-warnings --test tests/sim.test.ts tests/primitives.test.ts tests/planner.test.ts tests/surface.test.ts",
+    "test:planner": "node --experimental-strip-types --no-warnings --test tests/planner.test.ts tests/surface.test.ts",
     "paint": "node --experimental-strip-types --no-warnings --max-old-space-size=6000 tests/paint-image.ts",
     "forms": "node --experimental-strip-types --no-warnings tests/forms-image.ts",
     "diagnose": "node --experimental-strip-types --no-warnings --max-old-space-size=6000 tests/diagnose.ts",
