@@ -12,14 +12,15 @@ npm run diagnose -- --fast --scene portrait --look oil   # other scenes in tests
 npm run diagnose -- --fast --look oil --forms 0 --streaks 0 --tone 0 --restraint 0 --presses 0 --scale 0   # round 3's plan under the oil look
 # also --defer 1 to paint thin lights last
 python3 tests/diag-sheet.py out/diag && python3 tests/diag-compare.py out/diag out/diag-<name>
-npm run gpu-parity            # WebGPU shader against the CPU reference, both looks (headless Chromium)
+npm run gpu-parity            # WebGPU viewer against the CPU reference, both looks (headless Chromium)
+npm run test:viewer           # browser tests for the live viewer: GPU parity, fallbacks, demo page (about 2 min)
 ```
 
 The diagnostic reports, per crop: colour error and silhouettes kept at the plan, painted-colour and shaded stages; **expressiveness** (mean turn per stroke, share of curved strokes, width variation along strokes, variety of primitives); **relief hierarchy** (relief in structured against flat areas, sculptural peaks); and **physical realism** (share of paint in berms and heaps, groove index of fine ripple against form relief, bead index of glints breaking into specks, steep walls, and the volume ledger)); and **pigment** (colour gradient inside knife strokes against the photo's there, streak anisotropy as gradient across the stroke over gradient along it, and the share of the crop no knife stroke covers).
 
 ```sh
 npm test         # physics, stroke primitives, planner and determinism checks
-npm run viewer   # writes out/viewer-*.html for moving the light live in a WebGPU browser
+npm run viewer   # writes out/viewer-*.html for moving the light live (see Live viewer below)
 python3 tests/crop.py   # JPEG previews and 1:1 crops
 ```
 
@@ -36,8 +37,53 @@ Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan →
 - `src/canvas.ts`: canvas weave, two paint layers per cell, mass-conserving moves and slumping.
 - `src/relight.ts`: the reference renderer, with GGX clearcoat, ray-marched shadows and horizon occlusion.
 - `src/relight-gpu.ts`: WebGPU port of the renderer.
+- `src/surface.ts`: `ImpastoSurface`, the packed height and colour buffers a renderer needs, and the `.impasto` file format.
+- `src/viewer.ts`: the browser viewer (live WebGPU relighting with a static fallback); `src/viewer-bundle.ts` inlines it into pages.
 - `src/dmath.ts`: math that gives the same result on any JS engine. Paint code must not call `Math.sin`, `Math.pow`, `Math.exp` or `Math.random`.
 - `src/pigment.ts`: colour conversion. Node and cell RGB are stored as Kubelka-Munk K/S, so mixing behaves more like pigment.
+
+## Live viewer
+
+`src/viewer.ts` is a browser-only module, no dependencies, that relights a painted surface live. Nothing in the paint path imports it, so the simulation runs the same with no GPU.
+
+```ts
+import { createImpastoViewer, attachPointerLight } from './viewer.ts';
+const viewer = await createImpastoViewer(canvasEl, surface /* ImpastoSurface */, {
+  light: { azimuth: 225, elevation: 30 },   // Partial<LightSettings>; defaults to DEFAULT_LIGHT
+  look: 'oil', view: 'paint',
+  fallback: { width, height, data },        // RGBA or RGB bytes, e.g. relight(canvas, DEFAULT_LIGHT)
+  onFallback: (reason) => console.warn(reason),
+});
+viewer.mode;                 // 'webgpu' | 'static'; fallbackReason says why it is static
+viewer.setLight({ azimuth: 45 }); viewer.setLook('locked'); viewer.setView('height'); // redraw on the next frame
+viewer.render();             // draw now
+await viewer.readPixels();   // RGBA, canvas width x height (tests)
+const detach = attachPointerLight(viewer, undefined, { mapping: 'linear', onChange: (l) => {} });
+viewer.destroy();
+```
+
+- **WebGPU path:** the surface's buffers go up as an `rg32float` height texture and an `rgba32float` colour texture, and `RELIGHT_WGSL` runs its two passes (HDR `fs`, then `composite` with the glow) on every change, at one canvas pixel per cell (scale with CSS). `npm run gpu-parity` and `npm run test:viewer` check it against the CPU `relight()`: mean difference about 0.5 of an 8-bit level for both looks, a low side light with more relief, and the colour view.
+- **Fallback:** the viewer goes to `mode: 'static'` if `navigator.gpu` is missing, `requestAdapter()` gives null or throws, the surface is larger than the GPU's texture limit, device creation or pipeline setup fails, or the device is later lost. It never throws for these; it calls `onFallback(reason)` once and fires a `modechange` event. A canvas that has had a WebGPU context cannot give a 2D one, so after a lost device the viewer swaps an identical fresh `<canvas>` into the DOM (`viewer.canvas` follows; `attachPointerLight` without an element follows too).
+- **Static drawing:** with a `fallback` image, the 'paint' view shows it as is (`interactive` is false: the light controls cannot change it); other views use the approximation. Without one, the viewer shades the height field itself: wrapped Lambert key, soft fill and a Blinn-Phong coat from the stored roughness. No shadows, occlusion or glow, so it is flatter than the reference, but the light still moves it (about 0.2 s per frame at 1200 x 900).
+- **Pointer drag:** `mapping: 'linear'` (default, as Milestone 0): horizontal position sets azimuth (left 360°, right 0°), vertical sets elevation (top 85°, bottom 5°). `'radial'`: the light comes from where you point, seen from the centre; the centre is overhead, the edge grazing.
+
+### `.impasto` files
+
+`encodeSurface(s)` / `decodeSurface(bytes)` in `surface.ts`, so a site can ship prerendered paintings. Little-endian, version 1: 8-byte magic `IMPASTO\x1a`, u32 version, u32 header size (48; data starts there, so a later version can grow the header), u32 w, u32 h, u32 flags (0), u32 reserved, f64 dx, f64 maxH, then `height` (w·h·2 f32) and `color` (w·h·4 f32), bit-exact. That is 24 bytes per cell: 26 MB for 120 x 90 mm at 0.1 mm, 233 MB for 360 x 270 mm. gzip only saves about 12% on these floats; a quantised version 2 (f16 or 16-bit heights) is the obvious next step if files must be small.
+
+### Demo pages
+
+```sh
+npm run viewer                                  # out/viewer-one-stroke.html, viewer-patch.html, and an empty viewer.html
+npm run paint -- --width 240 --export-surface   # also writes out/<name>.impasto
+npm run viewer -- out/lake.impasto              # out/viewer-lake.html, with out/lake-paint.png as its static fallback
+```
+
+Each page is self-contained (open it from disk): it inlines `viewer.ts` and its imports through an import map of `data:` URLs (`src/viewer-bundle.ts` strips the types with Node's own `stripTypeScriptTypes`, so no bundler is needed), and has sliders for azimuth, elevation, relief, glow and exposure, a light dial, look, view and drag-mapping menus, a "Use the static fallback" switch, a badge showing live WebGPU or static mode with the reason, and a button to open an `.impasto` or `.impasto.gz` file. Scene pages carry a CPU render at the default light as their fallback. Pages open on the 'locked' look; for a painting made with `--look oil`, pick Oil (its `-paint.png` fallback is already in that look).
+
+GPU memory is about 40 bytes per cell (two float textures plus the HDR target): about 43 MB at 1200 x 900, about 390 MB at 3600 x 2700, which some integrated or mobile GPUs may refuse; that ends in the static fallback.
+
+Headless Chromium here exposes WebGPU through SwiftShader. Presenting to an on-screen WebGPU canvas needs `--use-angle=swiftshader --enable-unsafe-swiftshader` as well; without them Chromium loses the device on the first frame, which `test:viewer` uses as a real device-loss case.
 
 ## Modelling choices
 
