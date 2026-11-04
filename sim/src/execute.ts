@@ -1,6 +1,6 @@
 /** Runs a stroke plan through the paint simulation. */
 import { PaintCanvas } from './canvas.ts';
-import { paintStroke, Tool, type StrokeStats } from './tool.ts';
+import { paintStroke, Tool, type StrokeSpec, type StrokeStats } from './tool.ts';
 import { reflectanceFromKs } from './pigment.ts';
 import { makeGrid, type Grid } from './image.ts';
 import type { Plan, PlannedStroke } from './planner.ts';
@@ -12,6 +12,12 @@ export function startPainting(plan: Plan, ground: RGB, dx = 0.1, canvasSeed = 7)
   return { canvas: new PaintCanvas(plan.widthMm, plan.heightMm, dx, ground, canvasSeed), tools: plan.tools.map((t) => new Tool(t)), stats: [] };
 }
 
+/** paintStroke's spec for a planned stroke: one literal, so every spec has the same shape (V8 specialises paintStroke on it). */
+type SpecFields = Pick<PlannedStroke, 'points' | 'gapMm' | 'pressMm' | 'seed' | 'engage' | 'taper' | 'taperMin' | 'breaks' | 'heap' | 'edgeFlaws' | 'pressure' | 'attackDeg' | 'speed' | 'deposition' | 'stiffness'>;
+function specOf(st: SpecFields): StrokeSpec {
+  return { points: st.points, gapMm: st.gapMm, pressMm: st.pressMm, seed: st.seed, engage: st.engage, taper: st.taper, taperMin: st.taperMin, breaks: st.breaks, heap: st.heap, edgeFlaws: st.edgeFlaws, pressure: st.pressure, attackDeg: st.attackDeg, speed: st.speed, deposition: st.deposition, stiffness: st.stiffness };
+}
+
 /** Paint the given strokes in order. Each one wipes the tool, reloads it and makes one pass. */
 export function paintStrokes(p: Painting, strokes: readonly PlannedStroke[]): void {
   for (const st of strokes) {
@@ -19,7 +25,7 @@ export function paintStrokes(p: Painting, strokes: readonly PlannedStroke[]): vo
     tool.wipe(st.wipe);
     if (st.profile) tool.loadProfile(st.volumePerNode, st.profile, st.secondary, st.secondaryFraction, st.mix ?? 1, st.seed ^ 0x5bd1e995);
     else tool.load(st.volumePerNode, st.primary, st.secondary, st.secondaryFraction, st.seed ^ 0x5bd1e995);
-    p.stats.push(paintStroke(p.canvas, tool, { points: st.points, gapMm: st.gapMm, pressMm: st.pressMm, seed: st.seed, engage: st.engage, taper: st.taper, taperMin: st.taperMin, breaks: st.breaks, heap: st.heap, edgeFlaws: st.edgeFlaws, pressure: st.pressure, attackDeg: st.attackDeg, speed: st.speed, deposition: st.deposition, stiffness: st.stiffness }));
+    p.stats.push(paintStroke(p.canvas, tool, specOf(st)));
   }
 }
 
