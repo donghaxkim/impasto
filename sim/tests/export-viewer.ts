@@ -1,20 +1,15 @@
 /** Writes out/viewer-<scene>.html: a self-contained page for moving the light live with WebGPU. */
 import { writeFileSync } from 'node:fs';
 import { oneStrokeScene, patchScene } from './scenes.ts';
-import { albedoField, DEFAULT_LIGHT, LOOKS, occlusionField, surfaceField } from '../src/relight.ts';
+import { DEFAULT_LIGHT, LOOKS } from '../src/relight.ts';
+import { surfaceFromCanvas } from '../src/surface.ts';
 import { RELIGHT_WGSL } from '../src/relight-gpu.ts';
 
 import type { PaintCanvas } from '../src/canvas.ts';
 
 /** A self-contained page that relights this canvas live with WebGPU. */
 export function viewerHtml(c: PaintCanvas): string {
-  const S = surfaceField(c), O = occlusionField(c), A = albedoField(c);
-  const height = new Float32Array(c.n * 2), color = new Float32Array(c.n * 4);
-  let maxH = 0;
-  for (let i = 0; i < c.n; i++) {
-    height[i * 2] = S[i]; height[i * 2 + 1] = O[i]; if (O[i] > maxH) maxH = O[i];
-    color[i * 4] = A[i * 3]; color[i * 4 + 1] = A[i * 3 + 1]; color[i * 4 + 2] = A[i * 3 + 2]; color[i * 4 + 3] = c.rough[i];
-  }
+  const { height, color, maxH } = surfaceFromCanvas(c);
   const html = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Impasto light viewer</title>
 <style>body{margin:0;background:#1c1a18;color:#ddd;font:13px system-ui;padding:12px}canvas{max-width:100%;display:block;margin-bottom:10px;cursor:crosshair}
