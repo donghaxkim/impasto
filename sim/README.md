@@ -12,8 +12,9 @@ npm run diagnose -- --fast --scene portrait --look oil   # other scenes in tests
 npm run diagnose -- --fast --look oil --forms 0 --streaks 0 --tone 0 --restraint 0 --presses 0 --scale 0 --shading 0 --bands 0 --press-restraint 0   # round 3's plan under the oil look
 # also --defer 1 to paint thin lights last
 python3 tests/diag-sheet.py out/diag && python3 tests/diag-compare.py out/diag out/diag-<name>
-npm run gpu-parity            # WebGPU viewer against the CPU reference, both looks (headless Chromium)
-npm run test:viewer           # browser tests for the live viewer: GPU parity, fallbacks, demo page (about 2 min)
+npm run gpu-parity            # WebGPU and WebGL2 viewer against the CPU reference, both looks (headless Chromium)
+npm run gpu-parity -- --time  # also the frame time of each backend at 1200 x 900
+npm run test:viewer           # browser tests for the live viewer: GPU parity, fallbacks, demo page (about 2.5 min)
 ```
 
 The diagnostic reports, per crop: colour error and silhouettes kept at the plan, painted-colour and shaded stages; **expressiveness** (mean turn per stroke, share of curved strokes, width variation along strokes, variety of primitives); **relief hierarchy** (relief in structured against flat areas, sculptural peaks); and **physical realism** (share of paint in berms and heaps, groove index of fine ripple against form relief, bead index of glints breaking into specks, steep walls, and the volume ledger)); and **pigment** (colour gradient inside knife strokes against the photo's there, streak anisotropy as gradient across the stroke over gradient along it, and the share of the crop no knife stroke covers).
@@ -41,7 +42,7 @@ const result = await renderImpasto(file, {        // ImageData, { width, height,
 });
 ctx.putImageData(new ImageData(result.image.data, result.image.width), 0, 0); // RGBA, lit on the CPU
 
-// Live light: WebGPU where available, otherwise the CPU image above (see "Live viewer").
+// Live light: WebGPU, else WebGL2, else the CPU image above (see "Live viewer").
 import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';
 const viewer = await createImpastoViewer(canvasEl, result.surface, { look: result.light.look, light: result.light, fallback: result.image });
 attachPointerLight(viewer);
@@ -98,8 +99,9 @@ Pipeline: image → `image.ts` analysis → `planner.ts` ordered stroke plan →
 - `src/canvas.ts`: canvas weave, two paint layers per cell, mass-conserving moves and slumping.
 - `src/relight.ts`: the reference renderer, with GGX clearcoat, ray-marched shadows and horizon occlusion.
 - `src/relight-gpu.ts`: WebGPU port of the renderer.
+- `src/relight-gl.ts`: WebGL2 (GLSL ES 3.00) port of the WebGPU shader, for browsers without WebGPU.
 - `src/surface.ts`: `ImpastoSurface`, the packed height and colour buffers a renderer needs, and the `.impasto` file format.
-- `src/viewer.ts`: the browser viewer (live WebGPU relighting with a static fallback); `src/viewer-bundle.ts` inlines it into pages.
+- `src/viewer.ts`: the browser viewer (live WebGPU or WebGL2 relighting with a static fallback); `src/viewer-bundle.ts` inlines it into pages.
 - `src/dmath.ts`: math that gives the same result on any JS engine. Paint code must not call `Math.sin`, `Math.pow`, `Math.exp` or `Math.random`.
 - `src/pigment.ts`: colour conversion. Node and cell RGB are stored as Kubelka-Munk K/S, so mixing behaves more like pigment.
 
@@ -114,8 +116,10 @@ const viewer = await createImpastoViewer(canvasEl, surface /* ImpastoSurface */,
   look: 'oil', view: 'paint',
   fallback: { width, height, data },        // RGBA or RGB bytes, e.g. relight(canvas, DEFAULT_LIGHT)
   onFallback: (reason) => console.warn(reason),
+  backends: ['webgpu', 'webgl2', 'static'], // the default order; ['webgl2'] forces WebGL2 (then static)
 });
-viewer.mode;                 // 'webgpu' | 'static'; fallbackReason says why it is static
+viewer.mode;                 // 'webgpu' | 'webgl2' | 'static'; fallbackReason says why it is static
+viewer.skipped;              // why earlier backends were passed over, e.g. ['webgpu: no WebGPU adapter ...']
 viewer.setLight({ azimuth: 45 }); viewer.setLook('locked'); viewer.setView('height'); // redraw on the next frame
 viewer.render();             // draw now
 await viewer.readPixels();   // RGBA, canvas width x height (tests)
@@ -124,7 +128,10 @@ viewer.destroy();
 ```
 
 - **WebGPU path:** the surface's buffers go up as an `rg32float` height texture and an `rgba32float` colour texture, and `RELIGHT_WGSL` runs its two passes (HDR `fs`, then `composite` with the glow) on every change, at one canvas pixel per cell (scale with CSS). `npm run gpu-parity` and `npm run test:viewer` check it against the CPU `relight()`: mean difference about 0.5 of an 8-bit level for both looks, a low side light with more relief, and the colour view.
-- **Fallback:** the viewer goes to `mode: 'static'` if `navigator.gpu` is missing, `requestAdapter()` gives null or throws, the surface is larger than the GPU's texture limit, device creation or pipeline setup fails, or the device is later lost. It never throws for these; it calls `onFallback(reason)` once and fires a `modechange` event. A canvas that has had a WebGPU context cannot give a 2D one, so after a lost device the viewer swaps an identical fresh `<canvas>` into the DOM (`viewer.canvas` follows; `attachPointerLight` without an element follows too).
+- **WebGL2 path** (`src/relight-gl.ts`), for browsers without WebGPU (older Safari and Firefox, many Linux and some Windows setups): the same two passes in GLSL ES 3.00, fed the same `relightUniforms()` block (as `uniform vec4 P[6]`), so both looks and every view (paint, colour, height, normals, highlights, cavities, glow) match. Height and colour go up as `RG32F` and `RGBA32F` textures read only with `texelFetch`, so no float-filtering extension is needed. The HDR target is `RGBA32F` with `EXT_color_buffer_float`, else `RGBA16F` (with that or `EXT_color_buffer_half_float`; specular is capped at 60000, far above where the composite saturates); with neither, WebGL2 is skipped. Shaders compile in the background where `KHR_parallel_shader_compile` exists. `readPixels()` renders the composite into an offscreen `RGBA8` target and returns it top-down. Parity against the CPU `relight()` (`npm run gpu-parity`, also in `test:viewer`): mean difference 0.503 levels for `locked`, 0.503 for `oil`, 0.500 for the low side light with relief 1.6, 0.474 for the colour view (0.467 with the half-float target, the paint cases unchanged to three decimals), and at most 0.57 for the other views (`oil`: height 0.495, highlights 0.565, cavities 0.126, glow 0.003, normals 0.000): the same as WebGPU.
+- **Backends:** `backends` (default `['webgpu', 'webgl2', 'static']`) is the order to try; the first that sets up is used. 'static' always ends the list, so `['webgl2']` forces WebGL2 and still never fails to draw; `forceStatic: true` is `['static']`. `viewer.skipped` lists why each earlier backend was passed over (a page in 'webgl2' mode can say why WebGPU was not used). If WebGPU took the canvas and then failed, WebGL2 gets a fresh twin canvas (`viewer.canvas` follows), since a canvas holds one kind of context for life.
+- **Software GL:** by default the viewer refuses a WebGL2 context on a software rasteriser (SwiftShader, llvmpipe: `failIfMajorPerformanceCaveat`, then the renderer string), because it is slower than the static fallback: in headless Chromium here, SwiftShader WebGL2 took 3.4-6.3 s per frame at 1200 x 900 against 0.09 s for the static approximation. `webgl: { software: true }` accepts one (the tests, and the demo page when WebGL2 is picked by hand).
+- **Fallback:** the viewer goes to `mode: 'static'` when no live backend sets up: for WebGPU, `navigator.gpu` is missing, `requestAdapter()` gives null or throws, the surface is larger than the GPU's texture limit, or device creation or pipeline setup fails; for WebGL2, there is no context, it is software, the surface exceeds `MAX_TEXTURE_SIZE` or `MAX_VIEWPORT_DIMS` (or the browser shrinks the drawing buffer), no float target is renderable, a shader fails to compile, or setup raises a GL error such as `OUT_OF_MEMORY`. It also goes static if a live backend is later lost: a lost WebGPU device, or a `webglcontextlost` event (not cancelled, so the browser does not restore it; `render()` and `readPixels()` also notice a lost context before the event arrives). It never throws for these; it calls `onFallback(reason)` once and fires a `modechange` event (`onFallback` is for static mode only; a viewer that settles on WebGL2 lists the WebGPU reason in `skipped`). A canvas that has had a WebGPU or WebGL context cannot give a 2D one, so after a loss the viewer swaps an identical fresh `<canvas>` into the DOM (`viewer.canvas` follows; `attachPointerLight` without an element follows too).
 - **Static drawing:** with a `fallback` image, the 'paint' view shows it as is (`interactive` is false: the light controls cannot change it); other views use the approximation. Without one, the viewer shades the height field itself: wrapped Lambert key, soft fill and a Blinn-Phong coat from the stored roughness. No shadows, occlusion or glow, so it is flatter than the reference, but the light still moves it (about 0.2 s per frame at 1200 x 900).
 - **Pointer drag:** `mapping: 'linear'` (default, as Milestone 0): horizontal position sets azimuth (left 360°, right 0°), vertical sets elevation (top 85°, bottom 5°). `'radial'`: the light comes from where you point, seen from the centre; the centre is overhead, the edge grazing.
 
@@ -140,11 +147,13 @@ npm run paint -- --width 240 --export-surface   # also writes out/<name>.impasto
 npm run viewer -- out/lake.impasto              # out/viewer-lake.html, with out/lake-paint.png as its static fallback
 ```
 
-Each page is self-contained (open it from disk): it inlines `viewer.ts` and its imports through an import map of `data:` URLs (`src/viewer-bundle.ts` strips the types with Node's own `stripTypeScriptTypes`, so no bundler is needed), and has sliders for azimuth, elevation, relief, glow and exposure, a light dial, look, view and drag-mapping menus, a "Use the static fallback" switch, a badge showing live WebGPU or static mode with the reason, and a button to open an `.impasto` or `.impasto.gz` file. Scene pages carry a CPU render at the default light as their fallback. Pages open on the 'locked' look; for a painting made with `--look oil`, pick Oil (its `-paint.png` fallback is already in that look).
+Each page is self-contained (open it from disk): it inlines `viewer.ts` and its imports through an import map of `data:` URLs (`src/viewer-bundle.ts` strips the types with Node's own `stripTypeScriptTypes`, so no bundler is needed), and has sliders for azimuth, elevation, relief, glow and exposure, a light dial, look, view and drag-mapping menus, a Renderer menu (Auto, WebGPU, WebGL2, Static fallback; `?backend=webgl2`, `webgpu` or `static` in the URL does the same, so `viewer-lake.html?backend=webgl2` opens on WebGL2), a badge showing live WebGPU, live WebGL2 or static mode with the reason (and, when live on WebGL2, why WebGPU was not used), and a button to open an `.impasto` or `.impasto.gz` file. Scene pages carry a CPU render at the default light as their fallback. Pages open on the 'locked' look; for a painting made with `--look oil`, pick Oil (its `-paint.png` fallback is already in that look).
 
-GPU memory is about 40 bytes per cell (two float textures plus the HDR target): about 43 MB at 1200 x 900, about 390 MB at 3600 x 2700, which some integrated or mobile GPUs may refuse; that ends in the static fallback.
+GPU memory is about 40 bytes per cell (two float textures plus the HDR target; 32 with a half-float HDR target in WebGL2, plus 4 for `readPixels`): about 43 MB at 1200 x 900, about 390 MB at 3600 x 2700, which some integrated or mobile GPUs may refuse; that ends in the static fallback.
 
-Headless Chromium here exposes WebGPU through SwiftShader. Presenting to an on-screen WebGPU canvas needs `--use-angle=swiftshader --enable-unsafe-swiftshader` as well; without them Chromium loses the device on the first frame, which `test:viewer` uses as a real device-loss case.
+Headless Chromium here exposes WebGPU through SwiftShader. Presenting to an on-screen WebGPU canvas needs `--use-angle=swiftshader --enable-unsafe-swiftshader` as well; without them Chromium loses the device on the first frame, which `test:viewer` uses as a real device-loss case. WebGL2 runs through ANGLE on SwiftShader with any of these flags (even `--disable-gpu`), with `EXT_color_buffer_float`, `EXT_color_buffer_half_float` and `WEBGL_lose_context`; the half-float path is tested by hiding `EXT_color_buffer_float` (`webgl.hideExtensions`), context loss with `WEBGL_lose_context`.
+
+Frame times at 1200 x 900 (`npm run gpu-parity -- --time`: the parity scene tiled 3 x 3, median of three light changes, each drawn and waited for), on SwiftShader, a CPU rasteriser on a 2-core machine shared with other jobs (load 2.6-2.9), so they say nothing about real GPUs, which are expected to be far faster: WebGL2 3.4-6.3 s per frame over two runs (setup about 9.5 s, mostly the shader compile on SwiftShader), WebGPU 20-32 s, the static approximation 0.09 s.
 
 ## Modelling choices
 
@@ -189,7 +198,7 @@ Below 24 mm (`FULL_LIFT_LENGTH`) a stroke's touch-down, lift-off, contact length
 
 ## Looks
 
-`LightSettings.look` (and `PlanSettings.look`): `'locked'` (default) is the reference look, pixel-identical to before, kept for regression comparison. `'oil'` is the intended replacement and also switches the planner's strokes to physical deposition; it becomes the default only once it is consistently better across several scenes. `'oil'` is semi-gloss: rougher coat, highlights filtered by how fast the normal turns within a pixel (Kaplanyan's geometric specular anti-aliasing) so crests carry continuous sheens instead of beads, weaker crest boost and second highlight window, gentler cavities, and a weaker knife edge profile on broad strokes. The WebGPU port takes the same parameters (`relightUniforms`); `npm run gpu-parity` checks both looks.
+`LightSettings.look` (and `PlanSettings.look`): `'locked'` (default) is the reference look, pixel-identical to before, kept for regression comparison. `'oil'` is the intended replacement and also switches the planner's strokes to physical deposition; it becomes the default only once it is consistently better across several scenes. `'oil'` is semi-gloss: rougher coat, highlights filtered by how fast the normal turns within a pixel (Kaplanyan's geometric specular anti-aliasing) so crests carry continuous sheens instead of beads, weaker crest boost and second highlight window, gentler cavities, and a weaker knife edge profile on broad strokes. The WebGPU and WebGL2 ports take the same parameters (`relightUniforms`); `npm run gpu-parity` checks both looks on both.
 
 ## Stroke planner
 

@@ -8,6 +8,7 @@
  * Every page can also open an `.impasto` (or gzipped `.impasto.gz`) file from disk. Scene pages
  * carry a CPU `relight()` render as the static fallback; a file page uses the `<name>-paint.png`
  * that `npm run paint -- --export-surface` writes beside it, else the viewer's approximate shading.
+ * The Renderer menu, or `?backend=webgpu|webgl2|static` in the URL, forces a backend.
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { readPng } from './png.ts';
@@ -48,13 +49,13 @@ h1{font-weight:500;font-size:22px;letter-spacing:.01em;margin:0 0 4px}
 .meta{color:var(--linen-dim);font-size:13px}
 #mode{display:inline-flex;align-items:center;gap:8px;font-size:13px;padding:3px 10px 3px 8px;border-radius:99px;border:1px solid currentColor}
 #mode::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor}
-#mode.webgpu{color:var(--brass)} #mode.static{color:var(--slate)} #mode.pending{color:var(--linen-dim)}
-#reason{color:var(--alarm);font-size:13px;max-width:70ch}
+#mode.webgpu,#mode.webgl2{color:var(--brass)} #mode.static{color:var(--slate)} #mode.pending{color:var(--linen-dim)}
+#reason{color:var(--alarm);font-size:13px;max-width:70ch} #reason.note{color:var(--linen-dim)}
 aside{display:flex;flex-direction:column;gap:14px}
 .dial{align-self:center;width:150px;height:150px;cursor:crosshair;touch-action:none}
 label{display:grid;grid-template-columns:84px 1fr 40px;align-items:center;gap:8px;font-size:14px}
 label output{color:var(--linen-dim);font-variant-numeric:tabular-nums;text-align:right}
-label.wide{grid-template-columns:84px 1fr}
+label.wide{grid-template-columns:84px 1fr} label.wide select{min-width:0;width:100%}
 input[type=range]{accent-color:var(--brass);width:100%}
 select,button,.file{font:inherit;font-size:14px;color:var(--linen);background:#ffffff0d;border:1px solid #ffffff2a;border-radius:6px;padding:5px 8px}
 button,.file{cursor:pointer;text-align:center} button:hover,.file:hover{background:#ffffff1a}
@@ -83,7 +84,7 @@ button,.file{cursor:pointer;text-align:center} button:hover,.file:hover{backgrou
  <label class="wide">Look <select id="look"><option value="locked">Locked (reference)</option><option value="oil">Oil (semi-gloss)</option></select></label>
  <label class="wide">View <select id="view"><option value="paint">Paint</option><option value="color">Colour</option><option value="height">Height</option><option value="normal">Normals</option><option value="spec">Highlights</option><option value="cavity">Cavities</option><option value="glow">Glow</option></select></label>
  <label class="wide">Drag <select id="mapping"><option value="linear">Across: x turns, y raises</option><option value="radial">Toward the light</option></select></label>
- <label class="check"><input id="static" type="checkbox"> Use the static fallback</label>
+ <label class="wide">Renderer <select id="backend"><option value="auto">Auto (best available)</option><option value="webgpu">WebGPU</option><option value="webgl2">WebGL2</option><option value="static">Static fallback</option></select></label>
  <button id="reset" type="button">Reset light</button>
  <span class="file" role="button" tabindex="0">Open .impasto file<input id="file" type="file" accept=".impasto,.gz,application/octet-stream"></span>
  <div id="err" role="alert"></div>
@@ -98,6 +99,9 @@ const $ = (id) => document.getElementById(id);
 const DEFAULT = ${JSON.stringify(DEFAULT_LIGHT)};
 const bytesOf = async (b64) => new Uint8Array(await (await fetch('data:application/octet-stream;base64,' + b64)).arrayBuffer());
 let surface = null, fallback = null, viewer = null, detach = null, seq = 0;
+// ?backend=webgpu|webgl2|static forces a renderer (the Renderer menu does the same).
+const asked = new URLSearchParams(location.search).get('backend');
+if ([...$('backend').options].some((o) => o.value === asked)) $('backend').value = asked;
 if ($('surface-data')) surface = decodeSurface(await bytesOf($('surface-data').textContent));
 if ($('fallback-data')) fallback = { ...JSON.parse($('fallback-meta').textContent), data: await bytesOf($('fallback-data').textContent) };
 
@@ -114,9 +118,12 @@ function status() {
   const m = $('mode');
   if (!viewer) { m.className = 'pending'; m.textContent = surface ? 'Starting' : 'No painting'; return; }
   m.className = viewer.mode;
-  m.textContent = viewer.mode === 'webgpu' ? 'Live WebGPU' : viewer.interactive ? 'Static fallback, approximate shading' : 'Static fallback image';
-  $('reason').hidden = viewer.mode === 'webgpu';
-  $('reason').textContent = viewer.fallbackReason ?? '';
+  m.textContent = viewer.mode === 'webgpu' ? 'Live WebGPU' : viewer.mode === 'webgl2' ? 'Live WebGL2' : viewer.interactive ? 'Static fallback, approximate shading' : 'Static fallback image';
+  // Static: why. Live on a later backend: why the earlier ones were passed over.
+  const live = viewer.mode !== 'static';
+  $('reason').hidden = live && !viewer.skipped.length;
+  $('reason').className = live ? 'note' : '';
+  $('reason').textContent = live ? 'Not used: ' + viewer.skipped.join('; ') : viewer.fallbackReason ?? '';
   $('hint').textContent = viewer.interactive ? 'Drag across the painting to move the light.' : 'This is a fixed render at the default light; other views use approximate shading.';
   const s = viewer.surface;
   $('size').textContent = s.w + ' × ' + s.h + ' cells, ' + +(s.w * s.dx).toFixed(1) + ' × ' + +(s.h * s.dx).toFixed(1) + ' mm';
@@ -127,9 +134,13 @@ async function start() {
   if (!surface) return;
   const canvas = document.createElement('canvas');
   $('frame').replaceChildren(canvas);
+  const backend = $('backend').value;
   const v = await createImpastoViewer(canvas, surface, {
     light: lightFromUi(), look: $('look').value, view: $('view').value, fallback: fallback ?? undefined,
-    forceStatic: $('static').checked, onFallback: (why) => { console.warn('impasto viewer:', why); status(); },
+    backends: backend === 'auto' ? undefined : [backend],
+    // Chosen by hand, WebGL2 runs even on a software rasteriser (slow, but it shows the shader).
+    webgl: { software: backend === 'webgl2' },
+    onFallback: (why) => { console.warn('impasto viewer:', why); status(); },
   });
   if (mine !== seq) { v.destroy(); return; }
   viewer = window.__viewer = v;
@@ -142,7 +153,12 @@ for (const id of sliders) $(id).addEventListener('input', () => { show(); viewer
 $('look').addEventListener('change', () => viewer?.setLook($('look').value));
 $('view').addEventListener('change', () => { viewer?.setView($('view').value); status(); });
 $('mapping').addEventListener('change', () => { detach?.(); if (viewer) detach = attachPointerLight(viewer, undefined, { mapping: $('mapping').value, onChange: syncFromViewer }); });
-$('static').addEventListener('change', start);
+$('backend').addEventListener('change', () => {
+  const u = new URL(location.href);
+  if ($('backend').value === 'auto') u.searchParams.delete('backend'); else u.searchParams.set('backend', $('backend').value);
+  try { history.replaceState(null, '', u); } catch { /* opaque origins */ }
+  start();
+});
 $('reset').addEventListener('click', () => { for (const id of sliders) $(id).value = DEFAULT[id]; show(); viewer?.setLight(lightFromUi()); });
 // The dial aims the light the radial way: the centre is overhead, the rim grazing.
 let aiming = false;

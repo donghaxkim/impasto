@@ -56,7 +56,7 @@ export async function startHarness(args: string[]): Promise<Harness> {
   pages.set('/', `<!doctype html><meta charset="utf-8"><title>viewer test</title><body>${viewerImportMap()}
 <script type="module">import * as V from 'impasto/viewer'; import * as S from 'impasto/surface'; window.V = V; window.S = S; window.__ready = true;</script>`);
   const server = http.createServer((q, r) => {
-    const body = pages.get(q.url ?? '/');
+    const body = pages.get((q.url ?? '/').split('?')[0]);
     if (body === undefined) { r.statusCode = 404; r.end(); return; }
     r.setHeader('content-type', 'text/html'); r.end(body);
   }).listen(0);

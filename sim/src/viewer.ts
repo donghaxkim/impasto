@@ -1,23 +1,28 @@
 /**
  * Live lighting layer for the browser. It takes the CPU simulation's packed surface
  * (`ImpastoSurface`) and relights it with the WebGPU port of the reference renderer
- * (`RELIGHT_WGSL`: an HDR pass, then a glow/composite pass). Where WebGPU is missing or fails, it
- * falls back to a 2D canvas: a supplied static image (normally a CPU `relight()` render at the
- * default light), or else a cheap CPU shading of the height field so the light still moves.
+ * (`RELIGHT_WGSL`: an HDR pass, then a glow/composite pass), or where WebGPU is missing or fails,
+ * with the same passes in WebGL2 (`relight-gl.ts`). Where neither works, it falls back to a 2D
+ * canvas: a supplied static image (normally a CPU `relight()` render at the default light), or
+ * else a cheap CPU shading of the height field so the light still moves.
  *
  * Browser-only, no dependencies. Nothing in the paint path imports this file.
  *
  *   const viewer = await createImpastoViewer(canvas, surface, { fallback, onFallback: console.warn });
  *   attachPointerLight(viewer);           // drag on the canvas to move the light
  *   viewer.setLight({ azimuth: 45 });     // redraws on the next animation frame
- *   viewer.mode;                          // 'webgpu' | 'static'
+ *   viewer.mode;                          // 'webgpu' | 'webgl2' | 'static'
  */
 import { DEFAULT_LIGHT, LOOKS, type LightSettings, type LookName, type View } from './relight.ts';
 import { RELIGHT_WGSL, relightUniforms } from './relight-gpu.ts';
+import { GlRelight, initWebGl2 } from './relight-gl.ts';
 import { linearToSrgb } from './pigment.ts';
 import type { ImpastoSurface } from './surface.ts';
 
-export type ViewerMode = 'webgpu' | 'static';
+export type ViewerMode = 'webgpu' | 'webgl2' | 'static';
+/** A way of drawing, in the order `createImpastoViewer` tries them by default. */
+export type ViewerBackend = ViewerMode;
+export const DEFAULT_BACKENDS: readonly ViewerBackend[] = ['webgpu', 'webgl2', 'static'];
 
 /** An RGBA (or RGB) 8-bit image, row-major. `ImageData` fits. */
 export interface FallbackImage { width: number; height: number; data: Uint8ClampedArray | Uint8Array }
@@ -30,18 +35,46 @@ export interface ViewerOptions {
   fallback?: FallbackImage;
   /** Called once, with the reason, when the viewer ends up in (or later switches to) static mode. */
   onFallback?: (reason: string) => void;
-  /** Skip WebGPU entirely (for testing the fallback, or to save power). */
+  /** Skip WebGPU and WebGL2 entirely (for testing the fallback, or to save power). Same as `backends: ['static']`. */
   forceStatic?: boolean;
+  /**
+   * Backends to try, in order (default `['webgpu', 'webgl2', 'static']`). The first that sets up
+   * is used. 'static' always ends the list, whether named or not, so the viewer never fails to
+   * draw: `['webgl2']` forces WebGL2 and falls back to static.
+   */
+  backends?: readonly ViewerBackend[];
+  /** WebGL2 settings. */
+  webgl?: {
+    /**
+     * Accept a WebGL2 context that runs on a software rasteriser (SwiftShader, llvmpipe). Off by
+     * default: such a context takes seconds per frame at 1200 x 900, slower than the static
+     * fallback. Headless browsers in tests only have software GL.
+     */
+    software?: boolean;
+    /** Test hook: treat these WebGL extensions as missing (e.g. 'EXT_color_buffer_float'). */
+    hideExtensions?: string[];
+  };
   /** WebGPU entry point to use instead of `navigator.gpu` (tests; `null` means unavailable). */
   gpu?: GPU | null;
 }
 
 export interface ImpastoViewer extends EventTarget {
-  /** 'webgpu' while the shader is live; 'static' after any fallback. Fires 'modechange' when it changes. */
+  /**
+   * 'webgpu' or 'webgl2' while the shader is live; 'static' after any fallback. Fires 'modechange'
+   * when it changes after creation.
+   */
   readonly mode: ViewerMode;
   /** Why the viewer is static, if it is. */
   readonly fallbackReason: string | null;
-  /** The element being drawn to. It changes once if the GPU device is lost (see 'modechange'). */
+  /**
+   * Why each backend tried at creation before the one in use was passed over, e.g.
+   * `['webgpu: no WebGPU adapter (requestAdapter returned null)']` for a viewer in 'webgl2' mode.
+   */
+  readonly skipped: readonly string[];
+  /**
+   * The element being drawn to. It changes once if the GPU device or WebGL context is lost (see
+   * 'modechange'), and at creation if WebGPU took the canvas and then failed.
+   */
   readonly canvas: HTMLCanvasElement;
   readonly surface: ImpastoSurface;
   readonly light: Readonly<LightSettings>;
@@ -51,6 +84,8 @@ export interface ImpastoViewer extends EventTarget {
   readonly interactive: boolean;
   /** The GPU device in webgpu mode, else null. */
   readonly gpuDevice: GPUDevice | null;
+  /** The WebGL2 context in webgl2 mode, else null. */
+  readonly glContext: WebGL2RenderingContext | null;
   /** Merges into the light and redraws on the next animation frame. */
   setLight(light: Partial<LightSettings>): void;
   setLook(look: LookName): void;
@@ -59,7 +94,7 @@ export interface ImpastoViewer extends EventTarget {
   render(): void;
   /** Draws, then reads back the canvas as RGBA (canvas width x height). */
   readPixels(): Promise<Uint8ClampedArray>;
-  /** Releases the GPU device and cancels pending frames. The canvas keeps its last frame. */
+  /** Releases the GPU device or GL objects and cancels pending frames. The canvas keeps its last frame. */
   destroy(): void;
 }
 
@@ -74,6 +109,9 @@ interface Gpu {
   outPipe: GPURenderPipeline; outGroup: GPUBindGroup;
   readPipe: GPURenderPipeline | null; readGroup: GPUBindGroup | null;
 }
+
+/** Canvases that have handed out a WebGPU context, and so can never give a WebGL or 2D one. */
+const webgpuCanvases = new WeakSet<HTMLCanvasElement>();
 
 function checkSurface(s: ImpastoSurface): void {
   const n = s.w * s.h;
@@ -93,6 +131,7 @@ async function initGpu(gpu: GPU | null | undefined, canvas: HTMLCanvasElement, s
   // Ask for the adapter's full texture size: the default device limit is 8192 whatever the GPU supports.
   try { device = await adapter.requestDevice({ requiredLimits: { maxTextureDimension2D: maxDim } }); } catch (e) { return `requestDevice failed: ${(e as Error).message}`; }
   const fail = (why: string) => { device.destroy(); return why; };
+  webgpuCanvases.add(canvas);
   const context = canvas.getContext('webgpu');
   if (!context) return fail('the canvas has no WebGPU context (it may already hold a 2D one)');
   try {
@@ -185,11 +224,14 @@ export class ApproxShader {
 class Viewer extends EventTarget implements ImpastoViewer {
   mode: ViewerMode = 'static';
   fallbackReason: string | null = null;
+  skipped: string[] = [];
   canvas: HTMLCanvasElement;
   readonly surface: ImpastoSurface;
   light: LightSettings;
   view: View;
   #gpu: Gpu | null = null;
+  #gl: GlRelight | null = null;
+  #glLost: (() => void) | null = null;
   #ctx2d: CanvasRenderingContext2D | null = null;
   #fallback: FallbackImage | undefined;
   #fallbackData: ImageData | null = null;
@@ -210,20 +252,65 @@ class Viewer extends EventTarget implements ImpastoViewer {
   }
   get look(): LookName { return this.light.look ?? 'locked'; }
   get gpuDevice(): GPUDevice | null { return this.#gpu?.device ?? null; }
-  get interactive(): boolean { return this.mode === 'webgpu' || !(this.#fallback && this.view === 'paint'); }
+  get glContext(): WebGL2RenderingContext | null { return this.#gl?.gl ?? null; }
+  get interactive(): boolean { return this.mode !== 'static' || !(this.#fallback && this.view === 'paint'); }
 
   async init(opts: ViewerOptions): Promise<void> {
-    const result = opts.forceStatic ? 'static mode requested (forceStatic)'
-      : await initGpu('gpu' in opts ? opts.gpu : (globalThis.navigator as Navigator | undefined)?.gpu, this.canvas, this.surface).catch((e: Error) => `WebGPU setup failed: ${e.message}`);
-    if (typeof result === 'string') { this.#toStatic(result, false); return; }
-    this.#gpu = result;
+    const order = opts.forceStatic ? [] : opts.backends ?? DEFAULT_BACKENDS;
+    for (const backend of order) {
+      if (backend === 'static') break;
+      if (backend === 'webgpu') {
+        const gpu = 'gpu' in opts ? opts.gpu : (globalThis.navigator as Navigator | undefined)?.gpu;
+        const result = await initGpu(gpu, this.canvas, this.surface).catch((e: Error) => `WebGPU setup failed: ${e.message}`);
+        if (typeof result !== 'string') { this.#startGpu(result); return; }
+        this.skipped.push(`webgpu: ${result}`);
+      } else if (backend === 'webgl2') {
+        // WebGPU may have taken the canvas before failing; a canvas holds one kind of context for life.
+        if (webgpuCanvases.has(this.canvas)) this.#swapCanvas();
+        let result: GlRelight | string;
+        try { result = await initWebGl2(this.canvas, this.surface, opts.webgl); } catch (e) { result = `WebGL2 setup failed: ${(e as Error).message}`; }
+        if (typeof result !== 'string') { this.#startGl(result); return; }
+        this.skipped.push(`webgl2: ${result}`);
+      }
+    }
+    const reason = opts.forceStatic ? 'static mode requested (forceStatic)' : this.skipped.length ? this.skipped.join('; ') : 'static mode requested (backends)';
+    this.#toStatic(reason, false);
+  }
+
+  #startGpu(g: Gpu): void {
+    this.#gpu = g;
     this.mode = 'webgpu';
-    result.device.lost.then((info) => {
-      if (this.#destroyed || this.#gpu?.device !== result.device) return;
+    g.device.lost.then((info) => {
+      if (this.#destroyed || this.#gpu?.device !== g.device) return;
       this.#gpu = null;
       this.#toStatic(`WebGPU device lost (${info.reason}${info.message ? ': ' + info.message : ''})`, true);
     });
     this.render();
+  }
+
+  #startGl(g: GlRelight): void {
+    this.#gl = g;
+    this.mode = 'webgl2';
+    const canvas = this.canvas;
+    // Not cancelled (no preventDefault), so the browser will not restore it: the viewer moves to
+    // static mode instead, as for a lost WebGPU device. render() and readPixels() also notice a
+    // lost context before the event arrives.
+    const lost = () => {
+      canvas.removeEventListener('webglcontextlost', lost);
+      if (this.#destroyed || this.#gl !== g) return;
+      this.#gl = null; this.#glLost = null;
+      this.#toStatic('WebGL2 context lost', true);
+    };
+    this.#glLost = lost;
+    canvas.addEventListener('webglcontextlost', lost);
+    this.render();
+  }
+
+  /** Puts an identical fresh `<canvas>` in place of the current one (in the DOM too). */
+  #swapCanvas(): void {
+    const fresh = this.canvas.cloneNode(false) as HTMLCanvasElement;
+    this.canvas.replaceWith(fresh);
+    this.canvas = fresh;
   }
 
   #toStatic(reason: string, replaceCanvas: boolean): void {
@@ -231,11 +318,9 @@ class Viewer extends EventTarget implements ImpastoViewer {
     this.fallbackReason = reason;
     let ctx = replaceCanvas ? null : this.canvas.getContext('2d');
     if (!ctx) {
-      // A canvas that has handed out a WebGPU context can never give a 2D one, so swap in a twin.
-      const fresh = this.canvas.cloneNode(false) as HTMLCanvasElement;
-      this.canvas.replaceWith(fresh);
-      this.canvas = fresh;
-      ctx = fresh.getContext('2d');
+      // A canvas that has handed out a WebGPU or WebGL context can never give a 2D one, so swap in a twin.
+      this.#swapCanvas();
+      ctx = this.canvas.getContext('2d');
     }
     this.#ctx2d = ctx;
     this.render();
@@ -256,12 +341,21 @@ class Viewer extends EventTarget implements ImpastoViewer {
   render(): void {
     if (this.#destroyed) return;
     if (this.#gpu) { this.#renderGpu(this.#gpu, this.#gpu.context.getCurrentTexture(), this.#gpu.outPipe, this.#gpu.outGroup); return; }
+    if (this.#gl) {
+      if (!this.#gl.gl.isContextLost()) { this.#gl.draw(this.#uniforms()); return; }
+      this.#glLost?.();
+      return;
+    }
     this.#renderStatic();
   }
 
-  #renderGpu(g: Gpu, target: GPUTexture, pipe: GPURenderPipeline, group: GPUBindGroup): GPUCommandEncoder {
+  #uniforms(): Float32Array<ArrayBuffer> {
     const s = this.surface;
-    g.device.queue.writeBuffer(g.uniforms, 0, relightUniforms(s.w, s.h, s.dx, s.maxH, this.light, VIEW_INDEX[this.view]) as Float32Array<ArrayBuffer>);
+    return relightUniforms(s.w, s.h, s.dx, s.maxH, this.light, VIEW_INDEX[this.view]) as Float32Array<ArrayBuffer>;
+  }
+
+  #renderGpu(g: Gpu, target: GPUTexture, pipe: GPURenderPipeline, group: GPUBindGroup): GPUCommandEncoder {
+    g.device.queue.writeBuffer(g.uniforms, 0, this.#uniforms());
     const e = g.device.createCommandEncoder();
     const p1 = e.beginRenderPass({ colorAttachments: [{ view: g.hdr.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 0] }] });
     p1.setPipeline(g.fsPipe); p1.setBindGroup(0, g.fsGroup); p1.draw(3); p1.end();
@@ -299,6 +393,12 @@ class Viewer extends EventTarget implements ImpastoViewer {
   }
 
   async readPixels(): Promise<Uint8ClampedArray> {
+    const gl = this.#gl;
+    if (gl && !gl.gl.isContextLost()) {
+      const px = gl.read(this.#uniforms());
+      if (!gl.gl.isContextLost()) { this.render(); return px; }
+    }
+    if (gl) this.#glLost?.();
     const g = this.#gpu;
     if (!g) {
       this.render();
@@ -337,14 +437,18 @@ class Viewer extends EventTarget implements ImpastoViewer {
     const g = this.#gpu;
     this.#gpu = null;
     if (g) { for (const t of g.textures) t.destroy(); g.uniforms.destroy(); g.device.destroy(); }
+    const gl = this.#gl;
+    this.#gl = null;
+    if (gl && !gl.gl.isContextLost()) gl.dispose();
   }
 }
 
 /**
  * Creates a viewer on `canvasEl`, sized to the surface (one canvas pixel per cell; scale it with
- * CSS). Resolves in 'webgpu' mode when the shader is running, else in 'static' mode with the
- * reason in `fallbackReason` (and `onFallback`). Missing WebGPU never rejects; a malformed
- * surface does (TypeError).
+ * CSS). Tries `opts.backends` in order (WebGPU, then WebGL2): resolves in 'webgpu' or 'webgl2'
+ * mode when a shader is running, else in 'static' mode with the reason in `fallbackReason` (and
+ * `onFallback`). Missing WebGPU or WebGL2 never rejects; a malformed surface does (TypeError).
+ * If WebGPU takes the canvas and then fails, WebGL2 gets a fresh twin (`viewer.canvas`).
  */
 export async function createImpastoViewer(canvasEl: HTMLCanvasElement, surface: ImpastoSurface, opts: ViewerOptions = {}): Promise<ImpastoViewer> {
   checkSurface(surface);
