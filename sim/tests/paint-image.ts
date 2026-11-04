@@ -11,8 +11,8 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { readPng, writePng } from './png.ts';
-import { DEFAULT_SETTINGS, planPainting, type Plan } from '../src/planner.ts';
-import { canvasColour, paintStrokes, startPainting, type Painting } from '../src/execute.ts';
+import { DEFAULT_SETTINGS, type Plan } from '../src/planner.ts';
+import { runPipeline } from '../src/pipeline.ts';
 import { DEFAULT_LIGHT, relight } from '../src/relight.ts';
 import { linearToSrgb } from '../src/pigment.ts';
 
@@ -38,17 +38,11 @@ const img = readPng(imagePath);
 const formSizesMm = opt('forms', '') === '0' ? [] : opt('forms', '') ? opt('forms', '').split(',').map(Number) : DEFAULT_SETTINGS.formSizesMm;
 const settings = { ...DEFAULT_SETTINGS, widthMm, seed, minLoad, look, formSizesMm, layers: DEFAULT_SETTINGS.layers.slice(0, layerCount).map((l, i) => (i === 0 ? l : { ...l, gapMm: l.gapMm * gapScale })) };
 const t0 = Date.now();
-let painting: Painting | null = null;
-let simMs = 0;
-const plan = planPainting(img, settings, simulate ? (layer, strokes, estimate, partial) => {
-  const t = Date.now();
-  painting ??= startPainting(partial, settings.ground);
-  paintStrokes(painting, strokes);
-  simMs += Date.now() - t;
-  console.log(`layer ${layer} ${partial.layerNames[layer]}: ${strokes.length} strokes, sim ${((Date.now() - t) / 1000).toFixed(1)} s`);
-  return feedback ? canvasColour(painting.canvas, estimate.w, estimate.h) : estimate;
-} : undefined);
-const planMs = Date.now() - t0 - simMs;
+// The same pipeline as the library's renderImpasto (src/pipeline.ts).
+const { plan, painting, simMs } = runPipeline(img, settings, { simulate, feedback }, (e) => {
+  if (simulate && e.stage !== 'analysed') console.log(`layer ${e.layer} ${e.name}: ${e.strokes.length} strokes, sim ${(e.simMs / 1000).toFixed(1)} s`);
+});
+const planMs = Math.round(Date.now() - t0 - simMs);
 console.log('plan', { strokes: plan.strokes.length, perLayer: plan.counts, planMs, hash: planHash(plan) });
 console.log('knife scale', plan.knifeScale);
 plan.stats.forEach((st, l) => console.log(`  ${plan.layerNames[l].padEnd(10)} seeds ${st.seeds}, accepted ${st.accepted}, too short ${st.tooShort}, overlapping ${st.overlapping}, no gain ${st.noGain}; ${JSON.stringify(st.primitives)}`));
@@ -59,7 +53,7 @@ writePreview(`${out}${name}-plan.png`, plan, PS, false);
 writePreview(`${out}${name}-strokes.png`, plan, PS, true);
 
 if (painting) {
-  const { canvas } = painting as Painting;
+  const { canvas } = painting;
   const t = Date.now();
   const px = relight(canvas, LIGHT, 'paint');
   writePng(`${out}${name}-paint.png`, canvas.w, canvas.h, px);
