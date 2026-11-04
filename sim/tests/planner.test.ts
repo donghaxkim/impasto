@@ -25,6 +25,10 @@ function landscape(w = 240, h = 120, treeW = 6): RgbImage {
 }
 
 const SMALL: Partial<PlanSettings> = { widthMm: 120, layers: scaleLayers(DEFAULT_SETTINGS.layers, 0.6), analysisMm: 0.5 };
+/** Settings that turn this round's planning off under 'oil' (what 'locked' always does). */
+const ROUND3: Partial<PlanSettings> = { formSizesMm: [], underTone: 0, restraint: 0, presses: false, autoScale: false };
+/** 'oil' with shapes but fixed knife sizes, for tests that measure against the image in mm. */
+const OIL: Partial<PlanSettings> = { ...SMALL, look: 'oil', autoScale: false };
 const digest = (o: unknown) => createHash('sha256').update(JSON.stringify(o)).digest('hex');
 
 test('planner: same image, settings and seed give an identical plan; a new seed differs', () => {
@@ -226,7 +230,7 @@ test('painting maps: silhouettes on the ridge and the tree, flat sky, more relie
 });
 
 test('primitives: flat areas get thin quiet strokes, structured ones thicker; the look sets the edge profile', () => {
-  const plan = planPainting(landscape(), SMALL), oil = planPainting(landscape(), { ...SMALL, look: 'oil', underTone: 0 });
+  const plan = planPainting(landscape(), SMALL), oil = planPainting(landscape(), { ...SMALL, ...ROUND3, look: 'oil' });
   const knives = plan.strokes.filter((st) => st.primitive !== 'underpaint');
   const kinds = new Set(knives.map((st) => st.primitive));
   for (const k of ['plane', 'mark', 'contour'] as const) assert.ok(kinds.has(k), `no ${k} strokes`);
@@ -239,8 +243,7 @@ test('primitives: flat areas get thin quiet strokes, structured ones thicker; th
   assert.ok(mean(sky, (st) => st.gapMm / SMALL.layers![st.layer].gapMm) < mean(rest, (st) => st.gapMm / SMALL.layers![st.layer].gapMm), 'sky paint is thinner');
   for (const st of plan.strokes) assert.equal(st.edgeFlaws, 1);
   assert.ok(oil.strokes.some((st) => st.edgeFlaws < 0.5));
-  // Untoned, the look changes the paint and not where it goes. (A toned underpainting changes what
-  // the later layers see, and so the plan.)
+  // With the shape-aware planning off, the look changes the paint and not where it goes.
   assert.deepEqual(oil.strokes.map((st) => st.points), plan.strokes.map((st) => st.points), 'the look does not change the plan');
 });
 
@@ -341,7 +344,7 @@ function figure(w = 240, h = 160): RgbImage {
 }
 
 test('forms: nested shapes; broad knives stay out of a shape they do not fit and paint shapes along their axis', () => {
-  const img = figure(), planner = new Planner(img, { ...DEFAULT_SETTINGS, ...SMALL });
+  const img = figure(), planner = new Planner(img, { ...DEFAULT_SETTINGS, ...OIL });
   const [coarse, mid, fine] = planner.forms.levels;
   assert.ok(coarse.count <= mid.count && mid.count <= fine.count, `${coarse.count} ${mid.count} ${fine.count}`);
   // Nested: every fine shape lies inside one middle shape.
@@ -365,7 +368,7 @@ test('forms: nested shapes; broad knives stay out of a shape they do not fit and
     checked++;
   }
   assert.ok(checked >= 2, `the figure is its own shape at ${checked} levels`);
-  const plan = planPainting(img, SMALL);
+  const plan = planPainting(img, { ...OIL, presses: false });
   const inEllipse = (x: number, y: number, grow: number) => { const ex = (x / 0.5 - 120) / (15 + grow), ey = (y / 0.5 - 80) / (25 + grow); return ex * ex + ey * ey < 1; };
   let intruding = 0, figureStrokes = 0, vertical = 0;
   for (const st of plan.strokes) {
@@ -386,7 +389,7 @@ test('forms: nested shapes; broad knives stay out of a shape they do not fit and
 
 test('pigment: under the oil look, knives carry the colours across their path; the underpainting is toned', () => {
   const img = figure();
-  const plain = planPainting(img, { ...SMALL, look: 'oil', streaks: false }), oil = planPainting(img, { ...SMALL, look: 'oil' });
+  const plain = planPainting(img, { ...OIL, streaks: false }), oil = planPainting(img, OIL);
   assert.ok(plain.strokes.every((st) => !st.profile));
   const knives = oil.strokes.filter((st) => st.primitive !== 'underpaint');
   assert.ok(knives.every((st) => st.profile && st.profile.length === 5 && st.mix! >= 0 && st.mix! <= 1));
@@ -396,4 +399,69 @@ test('pigment: under the oil look, knives carry the colours across their path; t
   const under = oil.strokes.filter((st) => st.primitive === 'underpaint'), locked = planPainting(img, SMALL).strokes.filter((st) => st.primitive === 'underpaint');
   const lum = (s: PlannedStroke[]) => s.reduce((a, st) => a + st.primary[0] + st.primary[1] + st.primary[2], 0) / s.length;
   assert.ok(lum(under) < lum(locked) - 0.1, `toned ${lum(under).toFixed(2)} vs ${lum(locked).toFixed(2)}`);
+});
+
+test('locked: the plan is exactly the round-3 plan (the regression baseline)', () => {
+  // Digest of the round-3 planner's strokes (commit 5c585bd) for this image and these settings.
+  const p = planPainting(landscape(), SMALL);
+  assert.equal(createHash('sha256').update(JSON.stringify(p.strokes)).digest('hex'), '5e4468a7885fa7472b3a3a9836d02cdce8a5bb29055266f0c4f20878e67f908f');
+  assert.equal(p.knifeScale, 1);
+  assert.ok(!p.layerNames.includes('presses'));
+});
+
+test('presses: a shape gets one wide press across it, and presses stay short and wide', () => {
+  const plan = planPainting(figure(), OIL);
+  const presses = plan.strokes.filter((st) => st.primitive === 'press');
+  assert.ok(plan.layerNames.includes('presses') && presses.length > 0, `${presses.length} presses`);
+  for (const st of presses) {
+    const f = st.footprint, a = f[0], b = f[f.length - 1], len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    assert.ok(len <= st.widthMm * 2.2 + 0.5, `press ${len.toFixed(1)} mm long, ${st.widthMm} mm wide`);
+  }
+  // The ellipse is 15 mm across: its press spans at least half of that, in its colour.
+  const inside = presses.filter((st) => st.primary[0] > st.primary[2] + 0.15 && st.footprint.every(([x, y]) => Math.hypot((x / 0.5 - 120) / 15, (y / 0.5 - 80) / 25) < 1.1));
+  assert.ok(inside.some((st) => st.widthMm >= 7.5), `figure presses ${inside.map((st) => st.widthMm).join(', ')} mm wide`);
+  // Inside the figure, the form-bound layers leave long ribbons out: at most 3.2 widths plus the tail
+  // (feature marks, traced freely, aside).
+  let over = 0, all = 0;
+  for (const st of plan.strokes) {
+    if (st.primitive === 'underpaint' || st.primitive === 'contour' || st.primitive === 'press') continue;
+    if (!['masses', 'forms', 'detail', 'accents'].includes(plan.layerNames[st.layer])) continue;
+    if (!st.footprint.every(([x, y]) => Math.hypot((x / 0.5 - 120) / 15, (y / 0.5 - 80) / 25) < 1)) continue;
+    // 3.2 widths, or the knife's minimum length where that is longer; plus the tail and one tracing step.
+    const cap = Math.max(9 * 1.05, 3.2 * st.widthMm) + 3 + 0.25 * st.widthMm + 0.01;
+    all++;
+    if (st.lengthMm > cap) over++;
+  }
+  assert.ok(all > 0 && over <= all * 0.1, `${over} of ${all} strokes in the figure longer than 3.2 widths`);
+});
+
+/** Dark glass with bright vertical mullions 1.5 mm wide every 20 mm, and one small bright fleck. */
+function facade(w = 240, h = 160): RgbImage {
+  const data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const mullion = (x % 40) >= 20 && (x % 40) < 23, fleck = Math.hypot((x - 60) / 4, (y - 120) / 2.5) < 1;
+    data.set(mullion || fleck ? [235, 232, 222] : [25, 40, 48 + Math.round(10 * y / h)], (y * w + x) * 3);
+  }
+  return { w, h, data };
+}
+
+test('thin bright features can go on last, over the paint around them; a small fleck gets its own mark', () => {
+  const plan = planPainting(facade(), { ...OIL, deferThin: true });
+  const light = (st: PlannedStroke) => st.primary[0] + st.primary[1] + st.primary[2] > 2.2;
+  const onMullion = (st: PlannedStroke) => st.footprint.every(([x]) => { const px = x / 0.5; return (px % 40) >= 17 && (px % 40) < 26; });
+  const lines = plan.strokes.filter((st) => light(st) && onMullion(st) && st.primitive !== 'underpaint');
+  assert.ok(lines.length >= 3, `${lines.length} mullion strokes`);
+  // Mullion marks go on after the last dark stroke: nothing dark is laid over them.
+  const lastDark = Math.max(...plan.strokes.filter((st) => !light(st) && st.primitive !== 'underpaint').map((st) => st.index));
+  const last = lines.filter((st) => st.index > lastDark);
+  assert.ok(last.length >= 3, `${last.length} of ${lines.length} mullion strokes after the last dark stroke`);
+  // The fleck, 4 x 2.5 mm, gets a light mark through it, also painted at the end.
+  const fleck = plan.strokes.filter((st) => light(st) && st.index > lastDark && st.footprint.some(([x, y]) => Math.hypot((x / 0.5 - 60) / 4, (y / 0.5 - 120) / 2.5) < 1.2));
+  assert.ok(fleck.length >= 1, `${fleck.length} fleck marks at the end`);
+});
+
+test('small features: without deferral, a small bright fleck still gets a mark in its own colour', () => {
+  const plan = planPainting(facade(), OIL);
+  const light = (st: PlannedStroke) => st.primary[0] + st.primary[1] + st.primary[2] > 2.2;
+  assert.ok(plan.strokes.some((st) => light(st) && st.layer === plan.layerNames.indexOf('accents') && st.footprint.some(([x, y]) => Math.hypot((x / 0.5 - 60) / 4, (y / 0.5 - 120) / 2.5) < 1.2)), 'no accent mark on the fleck');
 });

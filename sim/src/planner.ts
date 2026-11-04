@@ -66,7 +66,9 @@ export interface LayerSpec {
    * 'fill' (default) paints areas. 'contour' paints along silhouettes, offset to one side so the
    * blade's edge cuts a crisp boundary: the painter's "cutting in".
    */
-  kind?: 'fill' | 'contour';
+  kind?: 'fill' | 'contour' | 'press';
+  /** 'press' layers: the knife widths to choose from, mm (one tool per width and colour family). */
+  sizesMm?: number[];
   /** Choose a stroke primitive per stroke from the painting maps (default true; off for underpainting). */
   primitives?: boolean;
   /**
@@ -95,7 +97,7 @@ export interface LayerSpec {
  * from the simulation. Curvature comes from the seed's surroundings: marks and contours follow the
  * fine edge field and may turn a long way, sweeps follow the broad form field, planes stay stiff.
  */
-export type Primitive = 'underpaint' | 'sweep' | 'plane' | 'mark' | 'scumble' | 'pat' | 'contour' | 'accent';
+export type Primitive = 'underpaint' | 'sweep' | 'plane' | 'mark' | 'scumble' | 'pat' | 'contour' | 'accent' | 'press';
 
 export interface PlanSettings {
   /** Canvas width in mm; the height follows the image's aspect ratio. */
@@ -147,6 +149,23 @@ export interface PlanSettings {
    */
   restraint: number;
   /**
+   * With the 'oil' look: add a layer of shape-sized presses after the masses (one wide knife press
+   * per small or medium shape, the knife chosen to fit the shape), and keep strokes in the
+   * form-bound layers short and wide.
+   */
+  presses: boolean;
+  /**
+   * With the 'oil' look: scale the knives by how much structure the image has, so a close-up
+   * (a face, a flower) gets knives that are big against its forms. See knifeScale.
+   */
+  autoScale: boolean;
+  /**
+   * With the 'oil' look: paint thin marks and small features lighter than their surroundings after
+   * every layer. Off by default: with blades wider than a mullion, the darks painted after a light
+   * line are what cut it to width, and a light laid last over wet dark paint picks some of it up.
+   */
+  deferThin: boolean;
+  /**
    * With the 'oil' look: how far the underpainting is toned toward a warm dark (0 none, 1 fully), so
    * where it shows between knife strokes it reads as underpainting.
    */
@@ -191,6 +210,10 @@ export interface Plan {
   counts: number[];
   /** What happened to each layer's seeds. */
   stats: LayerStats[];
+  /** The layers as planned (the 'oil' look may scale them and add a press layer). */
+  layerNames: string[];
+  /** Knife scale applied (1 unless autoScale). */
+  knifeScale: number;
 }
 
 export interface LayerStats {
@@ -221,7 +244,7 @@ export const DEFAULT_LAYERS: LayerSpec[] = [
 export const DEFAULT_SETTINGS: PlanSettings = {
   widthMm: 240, layers: DEFAULT_LAYERS, seed: 1, analysisMm: 0.5,
   flatDirection: [1, 0], flatBias: 0.12, formWeight: 1.5, formSizesMm: [80, 35, 15], ground: [0.58, 0.47, 0.37], chroma: 1.06,
-  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0, underTone: 0.3,
+  lightBoost: 0.5, loadFactor: 1.15, minLoad: 6, tailMm: 3, look: 'locked', streaks: true, restraint: 0.5, presses: true, autoScale: true, deferThin: false, underTone: 0.3,
 };
 
 /** Scale every length in the layers, for canvases larger or smaller than ~240 mm. */
@@ -243,6 +266,9 @@ export function planPainting(img: RgbImage, settings: Partial<PlanSettings> = {}
     const strokes = planner.planLayer(l);
     if (feedback) planner.current = feedback(l, strokes, planner.current, planner.plan);
   }
+  // Thin high-contrast marks (mullions, stems, the white of an eye) go on last, over settled paint.
+  const last = planner.flushDeferred();
+  if (feedback && last.length) planner.current = feedback(planner.s.layers.length - 1, last, planner.current, planner.plan);
   return planner.plan;
 }
 
@@ -275,9 +301,19 @@ export function colourFamily(lab: ArrayLike<number>): number {
 }
 const SIDE = 0.36;
 /** Edge-profile strength per primitive in the 'oil' look. */
-const EDGE_FLAWS: Record<Primitive, number> = { underpaint: 1, sweep: 0.15, plane: 0.35, mark: 0.5, contour: 0.4, scumble: 0.65, pat: 0.7, accent: 0.6 };
+const EDGE_FLAWS: Record<Primitive, number> = { underpaint: 1, sweep: 0.15, plane: 0.35, mark: 0.5, contour: 0.4, scumble: 0.65, pat: 0.7, accent: 0.6, press: 0.3 };
 /** How well the paint on the knife is mixed per primitive with streaks on: broad sweeps blend, quick presses stay streaky. */
-const MIX: Record<Primitive, number> = { underpaint: 1, sweep: 0.75, plane: 0.35, mark: 0.45, contour: 0.6, scumble: 0.3, pat: 0.5, accent: 0.25 };
+const MIX: Record<Primitive, number> = { underpaint: 1, sweep: 0.75, plane: 0.35, mark: 0.45, contour: 0.6, scumble: 0.3, pat: 0.5, accent: 0.25, press: 0.4 };
+/** Press knife widths, as multiples of the masses knife (4 to 18 mm beside a 9.5 mm masses knife). */
+const PRESS_REL = [0.42, 0.63, 0.95, 1.37, 1.9];
+/** Longest press, in its own widths: a press is a short, wide plane. */
+const PRESS_ASPECT = 2.2;
+/** Longest stroke in a form-bound layer under 'oil', in blade widths. */
+const ASPECT_MAX = 3.2;
+/** Largest small feature (sclera, catchlight) guarded from restraint, mm across. */
+const FEATURE_MM = 5;
+/** Share of the canvas with structure (detail map above 0.45) at which knives keep their sizes. */
+const STRUCTURE_REF = 0.6;
 /** Colours sampled across the blade for a streaked load. */
 const PROFILE = 5;
 /** A warm dark (burnt-sienna-like, OKLab) that the underpainting is toned toward. */
@@ -298,30 +334,49 @@ export class Planner {
   private readonly cell: number;
   /** Lightly blurred image for sampling colour across a stroke (streaked loads), this layer. */
   private profRef: Grid | null = null;
+  /** Knife scale applied to the layers (see knifeScale). */
+  readonly knifeScale: number;
+  /** First tool of each layer in Plan.tools. */
+  private readonly toolBase: number[] = [];
+  /** Strokes held back to be painted last: thin high-contrast marks and features, with their layer. */
+  private deferred: { t: Traced; l: number; W: number }[] = [];
 
-  constructor(img: RgbImage, s: PlanSettings) {
-    this.s = s;
-    this.cell = s.analysisMm;
-    const heightMm = s.widthMm * img.h / img.w;
-    this.gw = Math.max(8, Math.round(s.widthMm / s.analysisMm));
-    this.gh = Math.max(8, Math.round(heightMm / s.analysisMm));
+  constructor(img: RgbImage, s0: PlanSettings) {
+    this.cell = s0.analysisMm;
+    const heightMm = s0.widthMm * img.h / img.w;
+    this.gw = Math.max(8, Math.round(s0.widthMm / s0.analysisMm));
+    this.gh = Math.max(8, Math.round(heightMm / s0.analysisMm));
     this.lin = resampleLinear(img, this.gw, this.gh);
     this.lab = toOklab(this.lin);
-    this.maps = paintingMaps(this.lab, s.analysisMm);
-    const areaMm2 = s.widthMm * heightMm;
-    this.forms = formHierarchy(this.lab, s.formSizesMm.map((d) => Math.max(3, Math.round(areaMm2 / (d * d)))));
+    this.maps = paintingMaps(this.lab, s0.analysisMm);
+    // 'locked' keeps the round-3 plan: no shapes, no presses, no scaling. 'oil' gets all of them.
+    const oil = s0.look === 'oil';
+    let s: PlanSettings = oil ? s0 : { ...s0, formSizesMm: [] };
+    this.knifeScale = oil && s.autoScale ? knifeScale(this.maps) : 1;
+    if (this.knifeScale !== 1) s = { ...s, layers: scaleGraded(s.layers, this.knifeScale), formSizesMm: s.formSizesMm.map((d) => d * this.knifeScale) };
+    if (oil && s.presses && s.formSizesMm.length) s = { ...s, layers: withPresses(s.layers) };
+    this.s = s;
+    const areaMm2 = s.widthMm * heightMm, fc = FEATURE_MM * this.knifeScale / s.analysisMm;
+    this.forms = formHierarchy(this.lab, s.formSizesMm.map((d) => Math.max(3, Math.round(areaMm2 / (d * d)))), s.formSizesMm.length ? fc * fc : 0);
     this.current = makeGrid(this.gw, this.gh, 3);
     const g = [srgbToLinear(s.ground[0]), srgbToLinear(s.ground[1]), srgbToLinear(s.ground[2])];
     for (let i = 0; i < this.gw * this.gh; i++) for (let k = 0; k < 3; k++) this.current.data[i * 3 + k] = g[k];
     // Each layer keeps one knife per colour family, as a painter keeps a knife for each pile on the
     // palette, so residue left on a knife only ever mixes into like paint.
     const tools: ToolSpec[] = [];
-    s.layers.forEach((l, i) => { for (let f = 0; f < FAMILIES; f++) tools.push({ kind: l.tool, widthMm: l.widthMm, nodes: l.nodes, seed: (s.seed * 7919 + 101 + i * 37 + f * 1543) | 0 }); });
-    this.plan = { widthMm: s.widthMm, heightMm, tools, strokes: [], counts: [], stats: [] };
+    s.layers.forEach((l, i) => {
+      this.toolBase.push(tools.length);
+      if (l.kind === 'press') {
+        // One knife per size and colour family; seeds as for the other layers, offset by size.
+        l.sizesMm!.forEach((w, z) => { for (let f = 0; f < FAMILIES; f++) tools.push({ kind: 'knife', widthMm: w, nodes: pressNodes(w), seed: (s.seed * 7919 + 101 + i * 37 + f * 1543 + z * 7) | 0 }); });
+      } else for (let f = 0; f < FAMILIES; f++) tools.push({ kind: l.tool, widthMm: l.widthMm, nodes: l.nodes, seed: (s.seed * 7919 + 101 + i * 37 + f * 1543) | 0 });
+    });
+    this.plan = { widthMm: s.widthMm, heightMm, tools, strokes: [], counts: [], stats: [], layerNames: s.layers.map((l) => l.name), knifeScale: this.knifeScale };
   }
 
   /** Plan one layer against `this.current`, append it to the plan, and update the estimate. */
   planLayer(l: number): PlannedStroke[] {
+    if (this.s.layers[l].kind === 'press') return this.planPresses(l);
     const L = this.s.layers[l], { gw, gh, cell } = this, n = gw * gh, seed = this.s.seed;
     const W = L.widthMm / cell; // tool width in cells
     const ref = toOklab(gaussBlur(this.lin, L.blur * W));
@@ -352,7 +407,8 @@ export class Planner {
     // Restraint: deep inside a shape, leave the broad plane alone.
     if (region && this.s.restraint > 0 && L.detail > 0) for (let i = 0; i < n; i++) {
       const lb = region.label[i];
-      if (lb >= 0) seedErr[i] *= 1 - this.s.restraint * smoothstep((clearance(region, i, lb) - W) / W);
+      // Small high-contrast features (the white of an eye, a catchlight) are never held back.
+      if (lb >= 0 && this.forms.features.label[i] < 0) seedErr[i] *= 1 - this.s.restraint * smoothstep((clearance(region, i, lb) - W) / W);
     }
 
     const covered = new Uint8Array(n);
@@ -408,13 +464,20 @@ export class Planner {
       bare = 0;
       for (let i = 0; i < n; i++) bare += covered[i] ^ 1;
     }
-    this.plan.stats.push(st);
+    // The finest fill layer gives every small high-contrast feature its own mark.
+    if (region && l === this.finestFill()) this.featureMarks(W, L, ref, fineFlow, covered, accepted, st);
+    return this.emit(l, accepted, ref, W, st);
+  }
 
+  /** Order a layer's strokes, append them to the plan (holding back the ones painted last), stamp the estimate. */
+  private emit(l: number, accepted: Traced[], ref: Grid, W: number, st: LayerStats): PlannedStroke[] {
+    this.plan.stats.push(st);
     const ordered = this.orderLayer(accepted, ref, l);
     const out: PlannedStroke[] = [];
     for (const t of ordered) {
+      if ((t.thin || t.feature) && this.s.deferThin && this.standsOut(t, ref, W)) { this.deferred.push({ t, l, W }); this.stamp(t, l); continue; }
       const k = this.plan.strokes.length;
-      const ps = this.toStroke(t, l, k, W);
+      const ps = this.toStroke(t, l, k, t.w ?? W);
       this.plan.strokes.push(ps);
       out.push(ps);
       st.primitives[ps.primitive] = (st.primitives[ps.primitive] ?? 0) + 1;
@@ -422,6 +485,171 @@ export class Planner {
     }
     this.plan.counts.push(out.length);
     return out;
+  }
+
+  /**
+   * The held-back strokes, appended to the plan after every layer, dark to light, so bright
+   * mullions, stems and eye whites go on over settled paint.
+   */
+  flushDeferred(): PlannedStroke[] {
+    const d = this.deferred.map((e, k) => ({ ...e, k, band: Math.min(3, Math.floor(clamp01(e.t.lab[0]) * 4)) }));
+    this.deferred = [];
+    d.sort((a, b) => a.band - b.band || a.k - b.k);
+    const out: PlannedStroke[] = [];
+    for (const e of d) {
+      const ps = this.toStroke(e.t, e.l, this.plan.strokes.length, e.W);
+      this.plan.strokes.push(ps);
+      out.push(ps);
+      this.plan.counts[e.l]++;
+      const pr = this.plan.stats[e.l].primitives;
+      pr[ps.primitive] = (pr[ps.primitive] ?? 0) + 1;
+    }
+    return out;
+  }
+
+  /**
+   * Whether a thin mark is lighter than the paint either side of it (a bright mullion, a stem in
+   * light, the white of an eye): those go on last. Dark lines are left in their layer, where the
+   * lights painted after them keep them crisp.
+   */
+  private standsOut(t: Traced, ref: Grid, W: number): boolean {
+    const p = t.pts, n = p.length >> 1;
+    let side = 0, cnt = 0;
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(0, i - 1), b = Math.min(n - 1, i + 1);
+      let tx = p[b * 2] - p[a * 2], ty = p[b * 2 + 1] - p[a * 2 + 1];
+      const tl = Math.sqrt(tx * tx + ty * ty);
+      if (tl < 1e-9) continue;
+      tx /= tl; ty /= tl;
+      side += sampleE(ref, p[i * 2] - ty * W, p[i * 2 + 1] + tx * W, 0) + sampleE(ref, p[i * 2] + ty * W, p[i * 2 + 1] - tx * W, 0);
+      cnt += 2;
+    }
+    return cnt > 0 && t.lab[0] > side / cnt + 0.15;
+  }
+
+  /** The last form-bound fill layer: the one that gives small features their marks. */
+  private finestFill(): number {
+    let f = -1;
+    this.s.layers.forEach((L, i) => { if ((L.kind ?? 'fill') === 'fill' && (L.formLevel ?? -1) >= 0 && L.threshold > 0) f = i; });
+    return f;
+  }
+
+  /**
+   * A mark for every small high-contrast feature (forms.ts) this layer has not touched: traced from
+   * the feature's middle like any stroke, or, where it is too small for that, a short straight
+   * mark across it. Painted last, in the feature's own colour; the mark narrows to fit (widthRatios).
+   */
+  private featureMarks(W: number, L: LayerSpec, ref: Grid, flow: Grid, covered: Uint8Array, accepted: Traced[], st: LayerStats): void {
+    const F = this.forms.features, gw = this.gw, d = new Float64Array(2);
+    for (let f = 0; f < F.count; f++) {
+      const cells = F.cells[f];
+      let cx = 0, cy = 0;
+      for (const i of cells) { const x = i % gw; cx += x; cy += (i - x) / gw; }
+      cx /= cells.length; cy /= cells.length;
+      let best = cells[0], bd = 1e18;
+      for (const i of cells) { const x = i % gw, y = (i - x) / gw, dd = (x - cx) * (x - cx) + (y - cy) * (y - cy); if (dd < bd) { bd = dd; best = i; } }
+      if (covered[best]) continue;
+      st.seeds++;
+      const x0 = best % gw + 0.5, y0 = (best - (best % gw)) / gw + 0.5;
+      let t = this.trace(x0, y0, W, L, ref, flow, cosDeg(L.maxTurnDeg + 10), 0.6, null);
+      if (t && t.len > ASPECT_MAX * W) {
+        // A feature's mark stays short: the part of the path within 1.6 widths of the feature's middle.
+        const keep: number[] = [];
+        const r = ASPECT_MAX * W * 0.5;
+        for (let i = 0; i < t.pts.length; i += 2) { const dx = t.pts[i] - x0, dy = t.pts[i + 1] - y0; if (dx * dx + dy * dy <= r * r) keep.push(t.pts[i], t.pts[i + 1]); }
+        t = keep.length >= 4 ? { ...t, pts: keep, len: (keep.length / 2 - 1) * W * STEP } : null;
+      }
+      if (!t) {
+        directionAt(flow, x0 - 0.5, y0 - 0.5, 0, 0, d);
+        const half = Math.max(0.25 * L.minLenMm / this.cell, Math.sqrt(cells.length)), h = W * STEP, pts: number[] = [];
+        for (let q = -half; q <= half + 1e-9; q += h) pts.push(x0 + d[0] * q, y0 + d[1] * q);
+        t = { pts, lab: [], alt: [], spread: 0, len: pts.length > 2 ? (pts.length / 2 - 1) * h : h, cells: [] };
+      }
+      const col = [F.colour[f * 3], F.colour[f * 3 + 1], F.colour[f * 3 + 2]];
+      t.lab = col; t.alt = col.slice(); t.spread = 0; t.feature = true;
+      // As wide as the feature (its area as a disc), with the knife's edge if need be.
+      t.engage = clamp(2.2 * Math.sqrt(cells.length / 3.141592653589793) / W, 0.25, 1);
+      t.cells = this.footprint(t.pts, W);
+      for (const i of t.cells) covered[i] = 1;
+      accepted.push(t); st.accepted++;
+    }
+  }
+
+  /**
+   * Shape-sized presses: in each shape (at the layer's form level, merged and freed for the
+   * smallest press), the widest press that fits at its thickest uncovered point, straight along the
+   * shape, at most PRESS_ASPECT of its width long; then the next thickest point, until the shape is
+   * covered or too thin. A press is kept only where it brings the canvas closer to the image.
+   */
+  private planPresses(l: number): PlannedStroke[] {
+    const L = this.s.layers[l], { gw, gh, cell } = this, n = gw * gh, sizes = L.sizesMm!;
+    const st: LayerStats = { seeds: 0, tooShort: 0, overlapping: 0, noGain: 0, accepted: 0, primitives: {} };
+    const accepted: Traced[] = [];
+    const W0 = sizes[0] / cell;
+    const ref = toOklab(gaussBlur(this.lin, L.blur * W0));
+    if (!this.forms.levels.length) return this.emit(l, accepted, ref, W0, st);
+    const level = this.forms.levels[Math.min(L.formLevel ?? 2, this.forms.levels.length - 1)];
+    this.profRef = this.s.streaks ? toOklab(gaussBlur(this.lin, Math.max(0.6, 0.12 * W0))) : null;
+    const base = gaussBlur(this.lab, 0.6);
+    const flow = formFlow(mergeFields(
+      directionField(base, L.flowBlur * W0 * 2, this.s.flatDirection, this.s.flatBias),
+      directionField(base, L.flowBlur * W0 * 6, this.s.flatDirection, this.s.flatBias), this.s.formWeight), level, W0 * 2, 0.6);
+    // Nothing is freed for presses: a press never covers a thin shape (a mullion, a stem), however narrow.
+    const region = regionsAtScale(level, gw, gh, L.tolerance, REGION_MIN * W0 * W0, 0);
+    const cur = toOklab(this.current), err = new Float64Array(n);
+    for (let i = 0; i < n; i++) err[i] = dist(ref.data, i * 3, cur.data, i * 3);
+    const members = new Map<number, number[]>();
+    for (let i = 0; i < n; i++) { const lb = region.label[i]; if (lb >= 0) { let a = members.get(lb); if (!a) members.set(lb, (a = [])); a.push(i); } }
+    const covered = new Uint8Array(n), d = new Float64Array(2);
+    for (const lb of [...members.keys()].sort((a, b) => a - b)) {
+      const cells = members.get(lb)!;
+      for (let tries = 0; tries < 32; tries++) {
+        let best = -1, bc = -1;
+        for (const i of cells) if (!covered[i]) { const c = clearance(region, i, lb); if (c > bc) { bc = c; best = i; } }
+        if (best < 0) break;
+        const x0 = best % gw + 0.5, y0 = (best - (best % gw)) / gw + 0.5;
+        directionAt(flow, x0 - 0.5, y0 - 0.5, 0, 0, d);
+        const col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
+        // The widest knife that spans the shape here and whose two edges still land on its colour
+        // (a shape may hold structure finer than itself: petals in a flower head).
+        const across = (x: number, y: number, W: number) => Math.max(diffAt(ref, x - d[1] * W * 0.4, y + d[0] * W * 0.4, col), diffAt(ref, x + d[1] * W * 0.4, y - d[0] * W * 0.4, col));
+        let z = -1;
+        for (let q = 0; q < sizes.length; q++) if (sizes[q] / cell <= 2.1 * bc && (q === 0 || across(x0, y0, sizes[q] / cell) <= L.tolerance)) z = q;
+        if (z < 0) break;
+        const W = sizes[z] / cell, h = W * STEP;
+        st.seeds++;
+        const ends = [0, 0], maxLen = PRESS_ASPECT * W;
+        let taken = 1;
+        // Straight both ways while the blade stays in the shape and the colour holds.
+        for (let side = 0; side < 2; side++) {
+          const sg = side ? -1 : 1;
+          for (;;) {
+            if (ends[0] + ends[1] + h > maxLen) break;
+            const q = ends[side] + h, x = x0 + d[0] * q * sg, y = y0 + d[1] * q * sg;
+            if (x < 0 || y < 0 || x >= gw || y >= gh) break;
+            const j = Math.floor(y) * gw + Math.floor(x);
+            if (clearance(region, j, lb) < 0.4 * W || diffAt(ref, x, y, col) > L.tolerance || (z > 0 && across(x, y, W) > L.tolerance * 1.4)) break;
+            ends[side] = q; taken++;
+            for (let k = 0; k < 3; k++) col[k] += (sampleE(ref, x, y, k) - col[k]) / taken;
+          }
+        }
+        const len = ends[0] + ends[1];
+        const pts: number[] = [];
+        for (let q = -ends[1]; q <= ends[0] + 1e-9; q += h) pts.push(x0 + d[0] * q, y0 + d[1] * q);
+        const fp = this.footprint(pts.length >= 4 ? pts : [x0, y0, x0 + d[0] * h, y0 + d[1] * h], W);
+        if (len < 0.6 * W) { st.tooShort++; for (const i of fp) covered[i] = 1; continue; }
+        let before = 0, after = 0;
+        for (const i of fp) { before += err[i]; after += dist(ref.data, i * 3, col, 0); }
+        for (const i of fp) covered[i] = 1;
+        if (after >= before * 0.97) { st.noGain++; continue; }
+        // Marbling colour: the footprint sample farthest from the mean.
+        let far = fp[0], farD = -1;
+        for (const i of fp) { const dd = dist(ref.data, i * 3, col, 0); if (dd > farD) { farD = dd; far = i; } }
+        accepted.push({ pts, lab: col, alt: [ref.data[far * 3], ref.data[far * 3 + 1], ref.data[far * 3 + 2]], spread: Math.min(farD, L.tolerance * 1.5), len, cells: fp, w: W, size: z, press: true });
+        st.accepted++;
+      }
+    }
+    return this.emit(l, accepted, ref, W0, st);
   }
 
   /**
@@ -494,9 +722,14 @@ export class Planner {
     // Distance to the nearest other shape: the blade may reach into it only by its margin.
     const insetAt = (x: number, y: number) => clearance(level!, Math.min(gh - 1, Math.max(0, Math.floor(y))) * gw + Math.min(gw - 1, Math.max(0, Math.floor(x))), lab0);
     // A shape too narrow for this blade is left to a finer layer.
-    if (level && lab0 < 0) level = null;
+    // Seeded in a part too narrow to bind anybody (a mullion, a stem): free, and painted last.
+    const thin = !!level && lab0 < 0;
+    if (thin) level = null;
     if (level && insetAt(x0, y0) < FORM_FIT * W) return null;
-    const h = W * STEP, minLen = L.minLenMm / cell, maxLen = Math.max(minLen * 1.05, L.maxLenMm * lenMul / cell);
+    const h = W * STEP, minLen = L.minLenMm / cell;
+    let maxLen = Math.max(minLen * 1.05, L.maxLenMm * lenMul / cell);
+    // Inside shapes under 'oil': short, wide planes rather than long ribbons.
+    if ((level || thin) && this.s.presses) maxLen = Math.min(maxLen, Math.max(minLen * 1.05, ASPECT_MAX * W));
     const col = [sampleE(ref, x0, y0, 0), sampleE(ref, x0, y0, 1), sampleE(ref, x0, y0, 2)];
     let taken = 1;
     const d = new Float64Array(2), m = new Float64Array(2);
@@ -596,7 +829,7 @@ export class Planner {
     let far = 0, farD = -1;
     // The marbling colour: the sample farthest from the mean, among those the blade really carries.
     for (let i = 0, q = 0; i < samples.length; i += 3, q++) { const dd = dist(samples, i, mean, 0) * (weights[q] >= 1 ? 1 : weights[q]); if (dd > farD) { farD = dd; far = i; } }
-    return { pts, lab: mean, alt: [samples[far], samples[far + 1], samples[far + 2]], spread: farD, len, cells: [] };
+    return { pts, lab: mean, alt: [samples[far], samples[far + 1], samples[far + 2]], spread: farD, len, cells: [], ...(thin ? { thin } : {}) };
   }
 
   /** Cells within half a width of the centreline, in increasing index order. */
@@ -691,6 +924,13 @@ export class Planner {
     const shape = (o: Shape) => o;
     if (L.primitives === false || L.tool === 'bristle') {
       return shape({ primitive: 'underpaint', gap: 1, load: 1, press: 0, engage: 1, taper: [0, 0], taperMin: 0.2, breaks: 0, heap: 0.3, pressure: [1], attackDeg: 30, speed: 1 });
+    }
+    if (t.press) {
+      // One bold, loaded press laid flat and lifted into a heap: a facet, a petal.
+      return shape({ primitive: 'press', gap: 0.85 + 0.3 * R, load: 1.5 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.5, breaks: 0, heap: 1.2, pressure: [0.85, jit(1.15), 1.2, 1.1, 0.5 + 0.4 * R], attackDeg: 20 + 10 * h4, speed: 0.75 });
+    }
+    if (t.feature) {
+      return shape({ primitive: 'mark', gap: 0.9, load: 1.2 * pick, press: 0, engage: t.engage ?? 1, taper: [0, 0], taperMin: 0.2, breaks: 0, heap: 0.6, pressure: [0.6, jit(1), 1.05, 0.95, 0.5], attackDeg: 35, speed: 0.9 });
     }
     if (L.kind === 'contour') {
       return shape({ primitive: 'contour', gap: 0.85 + 0.35 * R, load: 0.8 * pick, press: 0, engage: 1, taper: [0, 0], taperMin: 0.15, breaks: 0, heap: 0.3, pressure: [0.5, 0.95, jit(1), 0.9, 0.35], attackDeg: 25, speed: 1.1 });
@@ -846,12 +1086,12 @@ export class Planner {
     const path = simplify(points.flatMap((p) => [p[0], p[1]]), Math.min(footprint.length, points.length));
     const lengthMm = t.len * cell + s.tailMm;
     const lightness = t.lab[0] < 0 ? 0 : t.lab[0] > 1 ? 1 : t.lab[0];
-    const nodes = L.nodes, pitch = L.widthMm / nodes;
+    const widthMm = t.size !== undefined ? L.sizesMm![t.size] : L.widthMm, nodes = t.size !== undefined ? pressNodes(widthMm) : L.nodes, pitch = widthMm / nodes;
     const h1 = hash(seed, index, 11), h2 = hash(seed, index, 12), h3 = hash(seed, index, 14), h4 = hash(seed, index, 15);
     const shape = this.choosePrimitive(t, L, lightness, h3, h4);
     // Narrow features narrow the mark: pressure follows the measured width along the path.
     let pressure = shape.pressure;
-    if (shape.primitive === 'mark' || shape.primitive === 'scumble') {
+    if ((shape.primitive === 'mark' || shape.primitive === 'scumble') && !t.feature) {
       const ratios = this.widthRatios(pts, W, this.lab, t.lab, L.tolerance * 1.4, pressure.length);
       pressure = pressure.map((p, q) => p * clamp((ratios[q] - 0.2) / 0.8, 0.3, 1.15));
     }
@@ -859,8 +1099,8 @@ export class Planner {
     const gap = L.gapMm * (1 - s.lightBoost * 0.5 + s.lightBoost * lightness) * shape.gap;
     const minLoad = s.minLoad * shape.load;
     return {
-      index, layer: l, tool: l * FAMILIES + colourFamily(t.lab), points: path, footprint,
-      widthMm: L.widthMm, lengthMm,
+      index, layer: l, tool: this.toolBase[l] + (t.size ?? 0) * FAMILIES + colourFamily(t.lab), points: path, footprint,
+      widthMm, lengthMm,
       primary: labToSrgb(this.paintLab(t, L), s.chroma), secondary: labToSrgb(mix3(this.paintLab(t, L), t.alt, 0.7), s.chroma),
       ...(this.profRef && L.tool === 'knife' ? { profile: this.profile(pts, W, t.lab).map((c) => labToSrgb(c, s.chroma)), mix: MIX[shape.primitive] } : {}),
       secondaryFraction: 0.12 + 0.3 * clamp01(t.spread / (L.tolerance * 1.5)),
@@ -876,7 +1116,15 @@ export class Planner {
   }
 }
 
-interface Traced { pts: number[]; lab: number[]; alt: number[]; spread: number; len: number; cells: number[]; }
+interface Traced {
+  pts: number[]; lab: number[]; alt: number[]; spread: number; len: number; cells: number[];
+  /** Presses: blade width in cells and index into the layer's sizes. */
+  w?: number; size?: number; press?: boolean;
+  /** Seeded in a freed narrow part; a dedicated mark for a small feature. Both painted last. */
+  thin?: boolean; feature?: boolean;
+  /** Features: the share of the blade in contact, so the mark is as wide as the feature. */
+  engage?: number;
+}
 
 const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
@@ -966,4 +1214,49 @@ function formFlow(flow: Grid, level: FormLevel, W: number, axisWeight: number): 
     out.data[i * 4] = c; out.data[i * 4 + 1] = s; out.data[i * 4 + 2] = coh; out.data[i * 4 + 3] = flow.data[i * 4 + 3];
   }
   return out;
+}
+
+/** Nodes across a press knife of width w mm (as the layers: about ten per mm, 48 to 128). */
+function pressNodes(w: number): number { return Math.max(48, Math.min(128, Math.round(w * 10))); }
+
+/**
+ * Knife scale from the image itself: the share of the canvas with structure at painting scale
+ * (detail map above 0.45). A busy scene (a lake with trees and rock, a glass facade) keeps the
+ * knives as they are; a close-up with few, large forms (a face, a flower) gets knives up to 2.2x
+ * as big, so its forms are laid in a few broad planes. (STRUCTURE_REF / share)^2, rounded.
+ */
+export function knifeScale(maps: PaintingMaps): number {
+  const n = maps.w * maps.h;
+  let c = 0;
+  for (let i = 0; i < n; i++) if (maps.detail[i] > 0.45) c++;
+  const share = c / n, r = share > 1e-6 ? STRUCTURE_REF / share : 2;
+  return Math.round(clamp(r * r, 1, 2.2) * 100) / 100;
+}
+
+/** The layers with a press layer after the first middle-level (masses) layer, its knives sized from that layer's. */
+function withPresses(layers: LayerSpec[]): LayerSpec[] {
+  let at = layers.findIndex((L) => L.formLevel === 1);
+  at = at < 0 ? Math.min(2, layers.length) : at + 1;
+  const sizes = PRESS_REL.map((r) => Math.round(r * layers[at - 1].widthMm * 100) / 100);
+  const press: LayerSpec = {
+    name: 'presses', tool: 'knife', widthMm: sizes[2], nodes: pressNodes(sizes[2]), minLenMm: sizes[0], maxLenMm: sizes[sizes.length - 1] * PRESS_ASPECT,
+    spacing: 1, threshold: 0.03, tolerance: 0.07, blur: 0.3, flowBlur: 0.6, gapMm: 0.3, maxTurnDeg: 0, coverSkip: 0.5, passes: 1,
+    sideWeight: 0.5, detail: 0, kind: 'press', formLevel: 2, sizesMm: sizes,
+  };
+  return [...layers.slice(0, at), press, ...layers.slice(at)];
+}
+
+/**
+ * Knife scaling graded by size: the broad knives (the masses knife and wider) take the full scale,
+ * the finest keep their size, those between take a share. A close-up gets broad planes and still
+ * has a fine knife for an eye or a stem.
+ */
+function scaleGraded(layers: LayerSpec[], k: number): LayerSpec[] {
+  const knives = layers.filter((L) => L.tool === 'knife');
+  const wMin = Math.min(...knives.map((L) => L.widthMm)), ref = layers.find((L) => L.formLevel === 1)?.widthMm ?? Math.max(...knives.map((L) => L.widthMm));
+  return layers.map((L) => {
+    const share = ref > wMin ? clamp((L.widthMm - wMin) / (ref - wMin), 0, 1) : 1, f = 1 + (k - 1) * share;
+    // Growing only, so no floors on the lengths (scaleLayers has them for shrinking).
+    return f === 1 ? L : { ...L, widthMm: L.widthMm * f, minLenMm: L.minLenMm * f, maxLenMm: L.maxLenMm * f };
+  });
 }

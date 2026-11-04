@@ -45,12 +45,13 @@ const plan = planPainting(img, settings, simulate ? (layer, strokes, estimate, p
   painting ??= startPainting(partial, settings.ground);
   paintStrokes(painting, strokes);
   simMs += Date.now() - t;
-  console.log(`layer ${layer} ${settings.layers[layer].name}: ${strokes.length} strokes, sim ${((Date.now() - t) / 1000).toFixed(1)} s`);
+  console.log(`layer ${layer} ${partial.layerNames[layer]}: ${strokes.length} strokes, sim ${((Date.now() - t) / 1000).toFixed(1)} s`);
   return feedback ? canvasColour(painting.canvas, estimate.w, estimate.h) : estimate;
 } : undefined);
 const planMs = Date.now() - t0 - simMs;
 console.log('plan', { strokes: plan.strokes.length, perLayer: plan.counts, planMs, hash: planHash(plan) });
-plan.stats.forEach((st, l) => console.log(`  ${settings.layers[l].name.padEnd(10)} seeds ${st.seeds}, accepted ${st.accepted}, too short ${st.tooShort}, overlapping ${st.overlapping}, no gain ${st.noGain}; ${JSON.stringify(st.primitives)}`));
+console.log('knife scale', plan.knifeScale);
+plan.stats.forEach((st, l) => console.log(`  ${plan.layerNames[l].padEnd(10)} seeds ${st.seeds}, accepted ${st.accepted}, too short ${st.tooShort}, overlapping ${st.overlapping}, no gain ${st.noGain}; ${JSON.stringify(st.primitives)}`));
 
 writeFileSync(`${out}${name}-plan.json`, JSON.stringify(plan));
 const PS = 0.25; // mm per preview pixel

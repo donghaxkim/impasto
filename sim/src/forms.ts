@@ -24,13 +24,25 @@ export interface FormLevel {
   contour: Float64Array;
 }
 
-export interface FormHierarchy { w: number; h: number; levels: FormLevel[]; }
+/**
+ * Small, high-contrast shapes found among the superpixels (the white of an eye, a catchlight, a
+ * bright fleck): too small to survive merging into forms, yet things a painter never loses.
+ */
+export interface Features {
+  /** Per cell: feature id, or -1. */
+  label: Int32Array;
+  count: number;
+  /** Per feature: cells, mean OKLab colour, contrast against its neighbours (OKLab distance). */
+  cells: number[][]; colour: Float64Array; contrast: Float64Array;
+}
+
+export interface FormHierarchy { w: number; h: number; levels: FormLevel[]; features: Features; }
 
 /**
  * @param lab OKLab image on the analysis grid.
  * @param counts target number of forms per level, coarse first (e.g. from the canvas area).
  */
-export function formHierarchy(lab: Grid, counts: number[]): FormHierarchy {
+export function formHierarchy(lab: Grid, counts: number[], featureMaxCells = 0, featureContrast = 0.12): FormHierarchy {
   const { w, h } = lab, n = w * h;
   const img = gaussBlur(lab, 0.8);
   // 1. Superpixels: Felzenszwalb-Huttenlocher with a small scale. Edges to the right, down,
@@ -84,6 +96,7 @@ export function formHierarchy(lab: Grid, counts: number[]): FormHierarchy {
     const a = sp[ea[e]], b = sp[eb[e]];
     if (a !== b) { adj[a].set(b, (adj[a].get(b) ?? 0) + 1); adj[b].set(a, (adj[b].get(a) ?? 0) + 1); }
   }
+  const features = findFeatures(n, sp, S, area, sum, adj, featureMaxCells, featureContrast);
   const ward = (a: number, b: number) => {
     let d2 = 0;
     for (let c = 0; c < 3; c++) { const x = sum[a * 3 + c] / area[a] - sum[b * 3 + c] / area[b]; d2 += x * x; }
@@ -128,7 +141,30 @@ export function formHierarchy(lab: Grid, counts: number[]): FormHierarchy {
   while (snapshots.length < targets.length) snap();
   const levels = snapshots.map((s2) => describe(w, h, lab, (i: number) => s2[sp[i]]));
   levels.reverse(); // coarse first
-  return { w, h, levels };
+  return { w, h, levels, features };
+}
+
+/** Superpixels of at most `maxCells` cells whose colour stands off their neighbours' by `minContrast`. */
+function findFeatures(n: number, sp: Int32Array, S: number, area: Float64Array, sum: Float64Array, adj: Map<number, number>[], maxCells: number, minContrast: number): Features {
+  const id = new Int32Array(S).fill(-1), colour: number[] = [], contrast: number[] = [];
+  let count = 0;
+  for (let a = 0; a < S; a++) {
+    if (area[a] > maxCells || area[a] < 3) continue;
+    let wsum = 0;
+    const nb = [0, 0, 0];
+    for (const [b, len] of adj[a]) { wsum += len; for (let k = 0; k < 3; k++) nb[k] += sum[b * 3 + k] / area[b] * len; }
+    if (!wsum) continue;
+    let d2 = 0;
+    for (let k = 0; k < 3; k++) { const x = sum[a * 3 + k] / area[a] - nb[k] / wsum; d2 += x * x; }
+    const c = Math.sqrt(d2);
+    if (c < minContrast) continue;
+    id[a] = count++;
+    for (let k = 0; k < 3; k++) colour.push(sum[a * 3 + k] / area[a]);
+    contrast.push(c);
+  }
+  const label = new Int32Array(n), cells: number[][] = Array.from({ length: count }, () => []);
+  for (let i = 0; i < n; i++) { const f = id[sp[i]]; label[i] = f; if (f >= 0) cells[f].push(i); }
+  return { label, count, cells, colour: Float64Array.from(colour), contrast: Float64Array.from(contrast) };
 }
 
 function describe(w: number, h: number, lab: Grid, find: (i: number) => number): FormLevel {

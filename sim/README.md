@@ -9,7 +9,8 @@ npm run paint -- photo.png --width 360 --plan-only   # just the stroke plan, in 
 npm run paint -- --look oil   # the same, with the new semi-gloss look
 npm run diagnose -- --fast    # three crops (mountains, spruce, lake): plan, colour, height, normals, render, metrics
 npm run diagnose -- --fast --scene portrait --look oil   # other scenes in tests/scenes.json (flowers, building, portrait; images in scenes/, not committed)
-npm run diagnose -- --fast --forms 0 --streaks 0 --tone 0   # this milestone's planner and pigment changes off, for comparison
+npm run diagnose -- --fast --look oil --forms 0 --streaks 0 --tone 0 --restraint 0 --presses 0 --scale 0   # round 3's plan under the oil look
+# also --defer 1 to paint thin lights last
 python3 tests/diag-sheet.py out/diag && python3 tests/diag-compare.py out/diag out/diag-<name>
 npm run gpu-parity            # WebGPU shader against the CPU reference, both looks (headless Chromium)
 ```
@@ -96,6 +97,14 @@ Research behind it: `docs/prior-art-research.md`.
   - Seeds go only where the blade fits. A shape too narrow for a blade is left to a finer one, and a stroke that meets its shape's edge may be a single short press.
   - The finest layers also seed in freed narrow parts (mullions, stems), narrowing their marks to fit.
   - So the broad knives block in masses without eating smaller shapes, and each scale refines the one before it.
+- **Strokes per shape** (`oil`):
+  - *Presses:* after the masses, a layer of shape-sized presses. In each shape, the planner takes its thickest uncovered point and picks the widest of five knives (0.42 to 1.9 times the masses knife) that spans the shape there with both edges still on its colour. It lays one straight, loaded press along the shape, at most 2.2 of its own widths long, then moves to the next thickest point. A petal or a facet becomes one or two bold presses rather than five narrow passes. Thin shapes (a mullion, a stem) count as edges for presses.
+  - *Short, wide strokes:* in the form-bound layers, strokes are at most 3.2 blade widths long, so surfaces are built from planes rather than long ribbons.
+  - *Restraint* (0.5): the form-bound layers discount their error more than two blade widths inside a shape, so broad planes stay broad and detail gathers at edges.
+  - *Small features* (`forms.ts`): superpixels up to 5 mm across whose colour stands at least 0.12 OKLab off their neighbours (the white of an eye, a catchlight, a fleck) are exempt from restraint. Each gets its own mark in the finest layer, as wide as itself and in its own colour.
+- **Knife size from the image** (`oil`, `autoScale`): knives are scaled by how much of the canvas has structure at painting scale (detail above 0.45). The factor is (0.6 / share)², from 1 to 2.2: about 1.8 for the portrait and flowers, 1.16 for the building, 1 for the lake. The scaling is graded by knife size. The masses knife and wider take all of it, the finest knives keep their size, so a close-up gets broad planes and still has a small knife for an eye.
+- **Deferring thin lights** (`deferThin`, off): this paints thin marks lighter than their surroundings after every layer. Tested on the glass facade, it made the mullions worse (0.53 against 0.67 of the edges kept in the painted colour). The blades are wider than a mullion, so it is the darks painted after a light line that cut it to width, and a light laid last over wet dark paint picks some of it up.
+- **`locked` is the round-3 plan:** with the `locked` look the planner ignores shapes, presses, scaling, restraint, streaks and toning, and a test pins its plan to the round-3 digest.
 - **Form-aware direction:** inside a shape, the direction blends three things:
   - image edges, weighted by their coherence;
   - the shape's principal axis, weighted by its elongation;
