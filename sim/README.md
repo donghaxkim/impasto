@@ -125,3 +125,40 @@ Research behind it: `docs/prior-art-research.md`.
 - **Deterministic:** only `+ - * / sqrt floor`, `dmath`, stable sorts with total-order keys, and hashing instead of a stateful random generator. `npm test` checks the plan and the painted canvas are identical across runs.
 
 Scale matters: knife sizes are physical, so a wider canvas gives more detail. At 240 mm the trees and peaks are smaller than the smallest stroke a knife can make; 360 mm reads well; 480 mm is finer still but takes about twice as long.
+
+## Performance
+
+`npm run bench` times the `npm run paint` pipeline stage by stage on the benchmark scenes (lake, portrait, flowers, building in `tests/scenes.json`; `synthetic` is a tiny built-in image for smoke tests). Each scene and width runs in its own child process, so peak memory is per run and a crash in one run does not stop the others. Results go to the console, to `out/bench/<name>.json`, `out/bench/<name>.md` and `out/bench/summary.md` (latest run), with the machine (CPU, cores, RAM, Node, git commit, date) and the load average at start and end. A busy machine (1-minute load above half the cores) is flagged, because its timings are inflated.
+
+```sh
+npm run bench -- --quick            # lake at 60 mm, about 15 s on a quiet machine
+npm run bench -- --scenes lake,portrait --width 120,240,scene --look oil --repeat 3 --json out/bench/mine.json
+npm run bench -- --plan-only        # planning only: no simulation, relight or surface
+npm run bench -- --quick --gpu      # also time the WebGPU relight in headless Chromium
+```
+
+Options: `--scenes` (comma list), `--width` (mm, `scene` for the scene's own width, or a fraction of it such as `0.5x`; several give a sweep), `--look oil|locked` (default `oil`), `--repeat N` (median shown, min in the JSON), `--quick`, `--plan-only`, `--gpu`, `--gpu-frames N` (default 5), `--json path`.
+
+Stages (ms, median of the repeats):
+
+- **load**: PNG decode. **setup**: the `Planner` constructor, which is **resample** (area-average onto the 0.5 mm analysis grid and OKLab), **analysis** (`paintingMaps`, knife scale) and **forms** (`formHierarchy`). Those three are timed standalone with the planner's own inputs, as a breakdown of setup; "forms breakdown matches planner" confirms they rebuilt what the planner built.
+- **planning**: `planLayer` for every layer and the deferred strokes. The bench drives the `Planner` layer by layer as `planPainting` does (a test checks it plans the same), so the simulation run between layers is not counted.
+- **canvas**: `startPainting` (allocating the canvas and its weave). **painting**: `paintStrokes`, the simulation. **readback**: `canvasColour`, the painted colour fed back to the planner after each layer. A per-layer table splits planning and painting by layer, with ms per stroke.
+- **relight**: one CPU `relight()` frame of the `paint` view, which is what one light change costs. **surface**: `surfaceFromCanvas`, packing for a viewer (not in total).
+- **total**: load + setup + planning + canvas + painting + readback + relight: the paint CLI with one relit view instead of four and no PNG output.
+
+Each stage is also given per million of three denominators: **image MP** (input photo pixels), **grid Mc** (planner cells, 0.5 mm) and **canvas Mc** (simulation cells, `widthMm / 0.1` x `heightMm / 0.1`). Canvas cells are the meaningful one: painting and relight scale with the canvas, and photo resolution only affects load and resample. Memory: peak RSS for the run, and heap used and external (typed arrays) sampled at stage boundaries.
+
+**Scaling and projections.** With two or more widths per scene, the bench fits time = a x (canvas Mc)^b per stage and projects to canvases of 1, 4, 12 and 24 Mc (at 0.1 mm per cell, an N MP photo painted one cell per pixel), and to 1, 4 and 12 MP photos at the scene's default width. These are labelled extrapolated, and rows more than 4x past the largest measured canvas are marked unreliable.
+
+**GPU relight** (`--gpu`): renders the WebGPU shader (`RELIGHT_WGSL`) on the same canvas in headless Chromium through Playwright, as `npm run gpu-parity` does, once per scene at its largest width: a warm-up frame, then the median of `--gpu-frames` frames (each changes the light azimuth, renders both passes and waits for the queue), plus one frame with readback, against the CPU `relight()`. Without WebGPU it reports "unavailable" and the reason. Headless Chromium here runs WebGPU on SwiftShader, a CPU implementation of Vulkan: its frame times describe a software rasteriser, not a GPU. A real GPU is expected to be orders of magnitude faster.
+
+**Full benchmark** (for a quiet 2-core machine; about 35-45 min expected, under 60):
+
+```sh
+npm run bench -- --scenes lake,portrait,flowers,building --width 0.33x,0.67x,1x --look oil --gpu --gpu-frames 3 --json out/bench/full.json
+```
+
+This paints each scene at a third, two thirds and all of its default width (about 0.7, 2.7 and 6 Mc each, as the defaults are all near 6 Mc), so each scene gets a three-point scaling fit. The GPU timing at full size takes about 2-3 min per scene on SwiftShader; drop `--gpu` to save it. Peak RSS at 6 Mc is about 2 GB, plus Chromium with `--gpu`.
+
+Calibration taken while three other jobs shared the machine (load average 4-9 on 2 cores, so roughly 2.5-3x slower than a quiet machine; not results): lake, `oil`, 120 mm (0.69 Mc, 487 strokes) 75 s in total, of which painting 57 s and CPU relight 10 s; 240 mm (2.77 Mc, 1487 strokes) 4.1 min, painting 3.0 min (122 ms per stroke), planning 19 s, setup 3.9 s, CPU relight 37 s, peak RSS 826 MB. Painting scaled with canvas cells to the power 0.84 and relight 0.94. The WebGPU shader on SwiftShader took 33 s per frame at 2.77 Mc. A light change on the CPU costs about 13 s per canvas Mc under that load, so live relighting needs the GPU path; the CPU renderer suits stills.
