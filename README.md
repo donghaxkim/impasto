@@ -5,6 +5,12 @@
   <a href="https://www.dongha.ca/lab/impasto"><b>Try it in your browser →</b></a>
 </p>
 
+
+
+https://github.com/user-attachments/assets/193102b0-4c64-45a1-ac00-cbfd3946b04e
+
+
+
 <p align="center">
   <img src="docs/images/hero.jpg" alt="A mountain lake painted by Impasto in thick palette-knife strokes" width="100%">
 </p>
