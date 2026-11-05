@@ -1,5 +1,5 @@
 /**
- * impasto-sim library entry: photo in, palette-knife oil painting out.
+ * tryimpasto library entry: photo in, palette-knife oil painting out.
  *
  *   const result = await renderImpasto(imageData, { preset: 'oil', widthMm: 240 });
  *   ctx.putImageData(new ImageData(result.image.data, result.image.width), 0, 0);
@@ -7,7 +7,7 @@
  * Runs in browsers, workers and Node. No Node or DOM modules are imported: browser image sources
  * are feature-detected at run time. The work is synchronous CPU work between `await`s (one layer at
  * a time, a few seconds to a minute each), so on a page's main thread the tab stays only partly
- * responsive; use `impasto-sim/worker` (see `renderInWorker`) to keep it off the main thread.
+ * responsive; use `tryimpasto/worker` (see `renderInWorker`) to keep it off the main thread.
  */
 import { type Plan, type PlanSettings } from './planner.ts';
 import { canvasFields, relight, type LightSettings } from './relight.ts';
@@ -401,7 +401,7 @@ function checkAbort(signal?: AbortSignal): void { if (signal?.aborted) throw abo
 function reportCallbackError(err: unknown): void {
   const re = (globalThis as G).reportError;
   if (typeof re === 'function') { try { (re as (e: unknown) => void)(err); return; } catch { /* fall through */ } }
-  console.error('impasto-sim: the onLayer callback threw; the render carries on.', err);
+  console.error('tryimpasto: the onLayer callback threw; the render carries on.', err);
 }
 
 /** Calls onLayer, which must not break the render (see ImpastoOptions.onLayer). */
@@ -508,9 +508,9 @@ export async function planImpasto(image: ImpastoImageSource, options: ImpastoOpt
 }
 
 // ---------------------------------------------------------------------------------------------
-// Worker client (the worker side is src/worker.ts, `impasto-sim/worker`)
+// Worker client (the worker side is src/worker.ts, `tryimpasto/worker`)
 
-/** A Worker running `impasto-sim/worker`, or a MessagePort served by `serveImpasto`. */
+/** A Worker running `tryimpasto/worker`, or a MessagePort served by `serveImpasto`. */
 export interface ImpastoWorkerLike {
   postMessage(message: unknown, transfer?: unknown[]): void;
   addEventListener(type: 'message' | 'error' | 'messageerror', listener: (e: any) => void): void;

@@ -1,5 +1,5 @@
 {
-  "name": "impasto-sim",
+  "name": "tryimpasto",
   "version": "0.1.0",
   "description": "Turn any photo into a palette-knife oil painting you can relight. Deterministic, zero dependencies, runs in the browser and Node.",
   "license": "MIT",

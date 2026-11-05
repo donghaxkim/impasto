@@ -28,10 +28,10 @@ python3 tests/crop.py   # JPEG previews and 1:1 crops
 
 ## Library API
 
-`src/index.ts` (package `impasto-sim`) wraps the same pipeline as `npm run paint` (`src/pipeline.ts`) in a promise. It runs in browsers, workers and Node and imports no Node or DOM modules.
+`src/index.ts` (package `tryimpasto`) wraps the same pipeline as `npm run paint` (`src/pipeline.ts`) in a promise. It runs in browsers, workers and Node and imports no Node or DOM modules.
 
 ```ts
-import { renderImpasto, ImpastoError } from 'impasto-sim';
+import { renderImpasto, ImpastoError } from 'tryimpasto';
 
 const result = await renderImpasto(file, {        // ImageData, { width, height, data } RGB/RGBA bytes,
   preset: 'oil',                                  // or in a browser a Blob/File, ImageBitmap, <img>, <canvas>
@@ -44,12 +44,12 @@ const result = await renderImpasto(file, {        // ImageData, { width, height,
 ctx.putImageData(new ImageData(result.image.data, result.image.width), 0, 0); // RGBA, lit on the CPU
 
 // Live light: WebGPU, else WebGL2, else the CPU image above (see "Live viewer").
-import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';
+import { createImpastoViewer, attachPointerLight } from 'tryimpasto/viewer';
 const viewer = await createImpastoViewer(canvasEl, result.surface, { look: result.light.look, light: result.light, fallback: result.image });
 attachPointerLight(viewer);
 ```
 
-`impasto-sim/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `impasto-sim`) save and load a result's `surface` as an `.impasto` file (quantised version 2, about 6 bytes per cell; `{ version: 1 }` for lossless floats, see `.impasto` files). The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
+`tryimpasto/viewer` is a separate entry so pages that only render never load it. `encodeSurface` / `decodeSurface` (exported from `tryimpasto`) save and load a result's `surface` as an `.impasto` file (quantised version 2, about 6 bytes per cell; `{ version: 1 }` for lossless floats, see `.impasto` files). The viewer's declarations mention WebGPU types: a TypeScript website either has `skipLibCheck` on (Vite's templates do) or adds `@webgpu/types`.
 
 - **Result:** `image` (RGBA `Uint8ClampedArray`, one pixel per 0.1 mm cell, lit at `light`), `surface` (`ImpastoSurface`, see `src/surface.ts`), `widthMm`, `heightMm`, `preset`, `seed`, `light` (as used), `strokes` (the count), `strokeList` (every stroke as plain data, below), `layerNames`, and `timings` in ms (`analyse`, `plan`, `paint`, `snapshot`, `relight`, `surface`, `total`).
 - **No CPU image:** `image: 'none'` skips the CPU relight (the slowest step after painting: about 1 s per million cells on a quiet core, 10% of a render) and returns `image: null`; everything else (`surface`, `strokeList`, `light`, progress ending at `done` / 1) is the same, and `timings.relight` is 0. For a page that relights live with `createImpastoViewer` and only wants the static picture as a fallback or download, which it can make later with `relightSurface(result.surface, result.light)` (float32 heights, so within rounding of the CPU image). The default is `'full'`. The type follows the option: `renderImpasto(file, { image: 'none' })` resolves to `ImpastoResultNoImage` (`image: null`); with an `image` value only known at run time it resolves to the union. `renderInWorker` takes and types it the same way.
@@ -105,8 +105,8 @@ attachPointerLight(viewer);
 - **Off the main thread:** between layers the render yields to the event loop, but each layer is seconds to a minute of synchronous work, so on a page use the worker:
 
   ```ts
-  import ImpastoWorker from 'impasto-sim/worker?worker';   // Vite syntax
-  import { renderInWorker } from 'impasto-sim';
+  import ImpastoWorker from 'tryimpasto/worker?worker';   // Vite syntax
+  import { renderInWorker } from 'tryimpasto';
   const worker = new ImpastoWorker();
   const result = await renderInWorker(worker, file, { preset: 'oil', onProgress, signal });
   ```
@@ -128,7 +128,7 @@ attachPointerLight(viewer);
 With the website and this repo side by side (`website/`, `impasto/`):
 
 1. Once, in `impasto/sim`: `npm install`. That installs TypeScript and builds `dist/` (the `prepare` script).
-2. In the website's `package.json`: `"impasto-sim": "file:../impasto/sim"`, then `npm install`. npm (10.x, checked) links the folder (a symlink, so `files` does not apply) and runs its `prepare` script on every `npm install` in the website, even when everything is up to date, which rebuilds `dist/` (about 10 s). It does not install `impasto/sim`'s devDependencies, so TypeScript comes from step 1; if that was skipped and there is no `dist/` yet, the install stops with a message saying to run it.
+2. In the website's `package.json`: `"tryimpasto": "file:../impasto/sim"`, then `npm install`. npm (10.x, checked) links the folder (a symlink, so `files` does not apply) and runs its `prepare` script on every `npm install` in the website, even when everything is up to date, which rebuilds `dist/` (about 10 s). It does not install `impasto/sim`'s devDependencies, so TypeScript comes from step 1; if that was skipped and there is no `dist/` yet, the install stops with a message saying to run it.
 3. After changing the simulation, run `npm run build` in `impasto/sim` (or `npm install` in the website); a running Vite dev server does not rebuild it. Or, for development, let Vite read the TypeScript sources directly through the package's `source` export condition (no build step, and edits hot-reload):
 
    ```ts
@@ -166,7 +166,7 @@ Everything after the simulation is byte-for-byte reproducible, and the optimisat
 `src/viewer.ts` is a browser-only module, no dependencies, that relights a painted surface live. Nothing in the paint path imports it, so the simulation runs the same with no GPU.
 
 ```ts
-import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';   // or './viewer.ts' inside this repo
+import { createImpastoViewer, attachPointerLight } from 'tryimpasto/viewer';   // or './viewer.ts' inside this repo
 const viewer = await createImpastoViewer(canvasEl, surface /* ImpastoSurface */, {
   light: { azimuth: 225, elevation: 30 },   // Partial<LightSettings>; defaults to DEFAULT_LIGHT
   look: 'oil', view: 'paint',

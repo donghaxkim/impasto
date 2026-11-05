@@ -43,12 +43,12 @@ Open `out/viewer-my-photo.html` in your browser and drag to move the light. A pa
 It isn't on npm yet, so point to your copy:
 
 ```jsonc
-"dependencies": { "impasto-sim": "file:../impasto/sim" }
+"dependencies": { "tryimpasto": "file:../impasto/sim" }
 ```
 
 ```ts
-import { renderImpasto } from 'impasto-sim';
-import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';
+import { renderImpasto } from 'tryimpasto';
+import { createImpastoViewer, attachPointerLight } from 'tryimpasto/viewer';
 
 const result = await renderImpasto(photo, { preset: 'oil' });
 

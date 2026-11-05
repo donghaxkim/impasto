@@ -21,10 +21,10 @@ try { tsc = createRequire(import.meta.url).resolve('typescript/bin/tsc'); } catc
 
 if (!tsc) {
   if (prepare && existsSync(`${root}dist/index.js`)) {
-    console.warn('impasto-sim: TypeScript is not installed in impasto-sim, keeping the existing dist/. Run `npm install` there to rebuild it.');
+    console.warn('tryimpasto: TypeScript is not installed in tryimpasto, keeping the existing dist/. Run `npm install` there to rebuild it.');
     process.exit(0);
   }
-  console.error(`impasto-sim: dist/ needs building and TypeScript is not installed in ${root}.\n  Run \`npm install\` in ${root} once (it builds dist/), then install again.`);
+  console.error(`tryimpasto: dist/ needs building and TypeScript is not installed in ${root}.\n  Run \`npm install\` in ${root} once (it builds dist/), then install again.`);
   process.exit(1);
 }
 // Build into a fresh folder and swap it in only on success, so a failed build leaves the last

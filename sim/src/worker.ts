@@ -4,8 +4,8 @@
  * Loaded as a module worker it serves requests on its own scope; on the page, `renderInWorker` /
  * `planInWorker` from the main entry talk to it:
  *
- *   import ImpastoWorker from 'impasto-sim/worker?worker';   // Vite
- *   import { renderInWorker } from 'impasto-sim';
+ *   import ImpastoWorker from 'tryimpasto/worker?worker';   // Vite
+ *   import { renderInWorker } from 'tryimpasto';
  *   const worker = new ImpastoWorker();
  *   const result = await renderInWorker(worker, file, { preset: 'oil', onProgress, signal });
  *
