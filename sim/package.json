@@ -1,9 +1,32 @@
 {
   "name": "impasto-sim",
-  "private": true,
   "version": "0.1.0",
-  "description": "Deterministic palette-knife impasto painting simulation: photo in, painted and relightable canvas out.",
+  "description": "Turn any photo into a palette-knife oil painting you can relight. Deterministic, zero dependencies, runs in the browser and Node.",
   "license": "MIT",
+  "author": "Dongha Kim",
+  "homepage": "https://www.dongha.ca/impasto",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/donghaxkim/impasto.git",
+    "directory": "sim"
+  },
+  "bugs": {
+    "url": "https://github.com/donghaxkim/impasto/issues"
+  },
+  "keywords": [
+    "painting",
+    "impasto",
+    "oil-painting",
+    "palette-knife",
+    "painterly",
+    "stroke-based-rendering",
+    "non-photorealistic-rendering",
+    "relighting",
+    "webgpu",
+    "webgl2",
+    "image-processing",
+    "generative-art"
+  ],
   "type": "module",
   "sideEffects": [
     "./dist/worker.js",
@@ -54,7 +77,8 @@
     "build": "node scripts/build.js",
     "typecheck": "tsc -p tsconfig.json",
     "prepare": "node scripts/build.js --prepare",
-    "test:api": "node --experimental-strip-types --no-warnings --test tests/api.test.ts"
+    "test:api": "node --experimental-strip-types --no-warnings --test tests/api.test.ts",
+    "prepublishOnly": "npm run build && npm test"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.74",
