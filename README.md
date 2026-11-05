@@ -6,6 +6,11 @@
 </p>
 
 <p align="center">
+  <a href="docs/images/demo.mp4"><img src="docs/images/demo-poster.jpg" alt="Demo video: a comic panel is painted stroke by stroke in the browser playground, then relit by turning the lamp" width="100%"></a><br>
+  <sub>▶ <a href="docs/images/demo.mp4">Watch the demo</a> (43 s): painting a photo in the browser playground, then turning the light.</sub>
+</p>
+
+<p align="center">
   <img src="docs/images/hero.jpg" alt="A photo of a mountain lake painted by Impasto as thick palette-knife oil paint" width="100%">
 </p>
 
