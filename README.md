@@ -1,7 +1,7 @@
 <h1 align="center">Impasto</h1>
 
 <p align="center">
-  Turn any photo into a thick, palette-knife oil painting.<br>
+  Deterministically turns any photo into a palette-knife painting.<br>
   <a href="https://www.dongha.ca/lab/impasto"><b>Try it in your browser →</b></a>
 </p>
 
