@@ -40,10 +40,8 @@ Open `out/viewer-my-photo.html` in your browser and drag to move the light. A pa
 
 ## Use it in your own code
 
-It isn't on npm yet, so point to your copy:
-
-```jsonc
-"dependencies": { "tryimpasto": "file:../impasto/sim" }
+```sh
+npm install tryimpasto
 ```
 
 ```ts
