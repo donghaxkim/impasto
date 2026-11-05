@@ -1,4 +1,4 @@
-<h1 align="center">Impasto</h1>
+<h1 align="center">impasto</h1>
 
 <p align="center">
   Turn any photo into a palette-knife painting.<br>
