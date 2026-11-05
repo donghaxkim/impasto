@@ -69,6 +69,8 @@ The [engine docs](sim/README.md) cover everything else, like running it in a wor
 3. **Paint.** Each stroke pushes simulated paint across a canvas. The paint piles up, mixes and holds its shape like the real thing.
 4. **Light.** The finished surface is lit like a real painting, with highlights and shadows that move with the light.
 
+For a more detailed explanation, read [how impasto works](https://www.dongha.ca/impasto).
+
 Built on ideas from Hertzmann's painterly rendering, Im2Oil, Paint Transformer and IMPaSTo.
 
 ## License
