@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "Deterministic palette-knife impasto painting simulation: photo in, painted and relightable canvas out.",
+  "license": "MIT",
   "type": "module",
   "sideEffects": [
     "./dist/worker.js",

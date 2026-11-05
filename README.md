@@ -1,61 +1,142 @@
-# Impasto · Milestone 0
+<h1 align="center">Impasto</h1>
 
-A browser prototype for exploring layered oil-paint marks under movable light. The current milestone is an authored visual proof: it renders two built-in scenes, a still-life composition and a compact material diagnostic. It does not include photo input, image conversion, WASM, spectral rendering, workers, or a second rendering backend.
+<p align="center">
+  <b>Turn a photo into a palette-knife oil painting you can relight.</b><br>
+  A deterministic paint simulation in plain TypeScript: plans knife strokes from an image, pushes real paint volume around a canvas, and renders the dried relief under a movable light.
+</p>
 
-## Requirements
+<p align="center">
+  <img src="docs/images/hero.jpg" alt="A photo of a mountain lake painted by Impasto as thick palette-knife oil paint" width="100%">
+</p>
 
-- Node.js 22.12 or newer
-- A browser with WebGPU enabled and a compatible GPU/driver
+<p align="center">
+  <img src="docs/images/pipeline.jpg" alt="Left to right: the source photo, the planned strokes, and the simulated painting" width="100%"><br>
+  <sub>Photo → stroke plan → simulated paint, relit on the CPU.</sub>
+</p>
 
-The page needs WebGPU to draw the canvas. If WebGPU is unavailable, the interface reports that state instead of showing a CPU-rendered fallback.
+> [!NOTE]
+> Impasto is experimental. The library API is usable but may still change, and it is not yet published to npm.
 
-## Run locally
+## Features
 
-Install the project dependencies, then start Vite:
+- **Photo in, painting out.** A coarse-to-fine planner (underpainting, block-in, masses, forms, detail, contours, accents) decides where every knife stroke goes, at what width and pressure, and with what paint on the blade.
+- **Simulated paint, not a filter.** Each stroke is dragged through a height-field simulation that conserves paint volume: plowed berms, terminal heaps, wet pickup, stiff paint that holds its shape. Colours mix with Kubelka–Munk.
+- **Relightable.** The result is a height and colour surface, not just a picture. Move the light and the ridges, cast shadows and satin highlights follow.
+- **Live viewer.** Relight in the browser with WebGPU, fall back to WebGL2, then to a static image. It never fails to draw.
+- **Deterministic.** The same photo and seed give byte-identical output on any JavaScript engine. Tests pin the plan and image digests.
+- **Zero runtime dependencies.** Runs in browsers, Web Workers and Node 22+.
+- **Portable output.** Save surfaces as compact `.impasto` files (about 6 bytes per cell) and export every stroke as plain JSON.
+
+<p align="center">
+  <img src="docs/images/detail.jpg" alt="A 1:1 crop of the painted surface showing knife ridges and highlights" width="80%"><br>
+  <sub>1:1 detail. One pixel is 0.1 mm of canvas.</sub>
+</p>
+
+## Quick start
+
+You need **Node.js 22** or newer. The engine lives in [`sim/`](sim).
 
 ```sh
+git clone https://github.com/donghaxkim/impasto.git
+cd impasto/sim
 npm install
-npm run dev
+
+# Paint the sample photo (sim/tests/fixtures/lake.png) into sim/out/
+npm run paint -- --look oil --width 240 --export-surface
+
+# Build a self-contained page to relight it in your browser
+npm run viewer -- out/lake.impasto      # writes out/viewer-lake.html
 ```
 
-Open the local URL printed by Vite. The app uses TypeScript and Vite; no image assets or remote service are required.
+Open `out/viewer-lake.html` straight from disk. Drag the canvas to move the light, and pick **Oil** in the look menu.
 
-## Controls
+To paint your own photo, pass its path: `npm run paint -- photo.png --look oil --width 240`.
 
-- Choose **Composition** or **Diagnostics** to switch authored documents.
-- Drag on the canvas to move the light; the azimuth and elevation sliders provide direct controls.
-- Adjust relief depth and surface roughness, or reset to the default lighting and material values.
-- Switch between **Paint**, **Color**, **Height**, and **Normal** views.
+> Painting is CPU-bound and scales with canvas area. A 240 mm wide canvas takes roughly 2–4 minutes. Use `--width 120` for quicker tries, or `--plan-only` to see just the stroke plan in seconds.
 
-The render-pass monitor reports counts for the current renderer instance. Changing lighting or view settings reruns the fullscreen lighting pass. Resizing the surface or switching scenes rebuilds the retained surfaces.
+## Use it as a library
 
-## Implementation outline
+Until the package is on npm, link it from a local checkout:
 
-- Scene data is authored deterministically in TypeScript (`src/scene.ts`). Each stroke carries its path, width, pigment color, brush profile, seed, height, and roughness.
-- `src/geometry.ts` samples the authored paths and builds indexed ribbon meshes. Invalid paths and unsafe reversals or crossings return empty geometry.
-- `src/renderer.ts` rasterizes ordered stroke geometry into separate retained pigment and relief textures. The relief field comes from stroke height and brush profile, independent of pigment brightness.
-- `src/shaders.ts` adds deterministic pigment variation and relief ridges, then derives screen-space normals and relights the retained surfaces in a fullscreen pass. Pigment is converted to linear light for surface compositing and encoded for display at presentation.
-- `src/main.ts` wires the scene selector, material and lighting controls, view modes, pointer-based light movement, and pass counters.
+```jsonc
+// your-app/package.json
+"dependencies": { "impasto-sim": "file:../impasto/sim" }
+```
 
-This is a screen-space material study. It does not model a full 3D canvas, physical paint transport, pigment mixing, or spectral reflectance. The authored geometry and shader fields are a visual approximation, and appearance can vary by GPU and browser.
+Render a photo, then relight it live:
 
-## Checks
+```ts
+import { renderImpasto } from 'impasto-sim';
+import { createImpastoViewer, attachPointerLight } from 'impasto-sim/viewer';
 
-Run the TypeScript check and production build with dependencies installed:
+const result = await renderImpasto(file, {   // File/Blob, ImageBitmap, <img>, <canvas> or ImageData
+  preset: 'oil',
+  widthMm: 240,                              // physical canvas width: more detail, more time
+  onProgress: ({ fraction }) => (bar.value = fraction),
+});
+
+const viewer = await createImpastoViewer(canvas, result.surface, {
+  look: result.light.look,
+  light: result.light,
+  fallback: result.image,                    // used if neither WebGPU nor WebGL2 is available
+});
+attachPointerLight(viewer);                  // drag to move the light
+```
+
+Each layer takes seconds of synchronous work, so on a web page run the render in a worker:
+
+```ts
+import ImpastoWorker from 'impasto-sim/worker?worker';   // Vite syntax
+import { renderInWorker } from 'impasto-sim';
+
+const result = await renderInWorker(new ImpastoWorker(), file, { preset: 'oil', signal });
+```
+
+The library also does per-layer snapshots for animating the painting as it builds (`onLayer`), aborting (`signal`), stroke export (`result.strokeList`) and `.impasto` save and load (`encodeSurface` / `decodeSurface`). See the **[full API reference](sim/README.md#library-api)**.
+
+## How it works
+
+```
+photo ─▶ analysis ─▶ stroke planner ─▶ paint simulation ─▶ surface ─▶ relight (CPU / WebGPU / WebGL2)
+         image.ts     planner.ts        execute.ts            surface.ts  relight*.ts, viewer.ts
+         structure.ts forms.ts          tool.ts, canvas.ts
+```
+
+1. **Analysis.** The photo is resampled onto a millimetre grid in OKLab. From it come an edge-following direction field, detail and silhouette maps, and a hierarchy of shapes.
+2. **Planning.** Layers of knives run from 15 mm down to 2.4 mm. Each layer paints only where the canvas still differs from the image at that scale. Strokes stay inside their shapes and follow the form.
+3. **Simulation.** Each knife is loaded and dragged across a woven canvas. Paint is plowed, picked up, deposited and heaped, with volume conserved. After each layer the planner sees what the paint really did.
+4. **Rendering.** The height and colour surface is lit with a GGX coat, ray-marched shadows and cavity occlusion. The WebGPU and WebGL2 ports match the CPU reference to within about half an 8-bit level.
+
+The design notes cover the details: modelling choices, stroke primitives, looks and the planner ([`sim/README.md`](sim/README.md)). The research the planner and simulation draw on is in [`sim/docs/prior-art-research.md`](sim/docs/prior-art-research.md).
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| [`sim/`](sim) | **The engine and library** (`impasto-sim`): planner, simulation, renderers, viewer, tests |
+| `src/`, `index.html` | The original Milestone 0 WebGPU prototype: two authored scenes under a movable light (`npm run dev` at the root) |
+| `review/` | Visual review notes and captures from early milestones |
+
+## Development
+
+All commands run in `sim/`:
 
 ```sh
+npm test                 # physics, stroke primitives, planner, determinism and API tests
 npm run typecheck
-npm run build
+npm run build            # builds dist/
+npm run bench -- --quick # stage-by-stage timing
+npm run diagnose -- --fast --look oil   # crops, maps and quality metrics for a scene
 ```
 
-The geometry tests use Node.js 22's experimental TypeScript stripping to import the TypeScript modules directly:
+The browser tests (`npm run test:viewer`, `npm run gpu-parity`) run headless Chromium through Playwright. A few helper scripts in `sim/tests/` need Python with Pillow.
 
-```sh
-node --experimental-strip-types --test
-```
+Paint code must stay deterministic. Use `dmath.ts` instead of `Math.sin`, `Math.pow`, `Math.exp` or `Math.random`, and keep sorts stable with total-order keys.
 
-The tests cover deterministic scene data, finite indexed mesh output, authored crossing cases, geometry independence from color/height metadata, invalid points, reversals, and self-intersections. These commands are documented here; run them in the current environment before treating their results as validated.
+## Acknowledgements
 
-## Milestone 0 handoff
+The planner builds on ideas from Hertzmann's *Painterly Rendering with Curved Brush Strokes of Multiple Sizes* (1998), Im2Oil and Paint Transformer. The simulation draws on Baxter et al.'s IMPaSTo and Sumner et al.'s height-field plowing. Shape segmentation uses Felzenszwalb–Huttenlocher superpixels. Specular anti-aliasing follows Kaplanyan et al. No third-party code is included.
 
-The retained-surface renderer, authored sample scenes, live light/material controls, debug views, and geometry checks form the current implementation boundary. There is no photo pipeline or production asset path in this milestone. A browser review should confirm GPU initialization, scene switching, relighting, resizing, and the visual readability of the four view modes on a WebGPU-capable device.
+## License
+
+[MIT](LICENSE)
