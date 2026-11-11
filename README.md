@@ -1,7 +1,7 @@
 <h1 align="center">impasto</h1>
 
 <p align="center">
-  Turn any photo into a palette-knife painting.<br>
+  Turn any photo into a palette-knife style painting.<br>
   <a href="https://www.dongha.ca/lab/impasto"><b>Try it in your browser →</b></a>
 </p>
 
